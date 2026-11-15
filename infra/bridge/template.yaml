@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  ArquiFusion Fleet Intelligence - Parte A - Puente a Google Cloud (Pub/Sub) y
+  respaldo a Azure Blob (A10). Solo serverless de pago por uso. Todos los recursos
+  usan LabRole y el prefijo af-. Los nombres se publican en SSM /arquifusion/{env}/.
+
+Metadata:
+  Proyecto: ArquiFusion Fleet Intelligence
+  Responsable: IA-4 (Puente y respaldo)
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [shared, test]
+    Default: test
+  LabRoleArn:
+    Type: String
+    Description: ARN de LabRole (SSM /arquifusion/{env}/root/lab-role-arn).
+  SourceKind:
+    Type: String
+    AllowedValues: [sqs, dynamodb]
+    Default: sqs
+    Description: Fuente que alimenta el puente. Su ARN se lee de SSM (ver README).
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 7 * * ? *)
+    Description: Horario del respaldo (UTC). Por defecto, todos los días a las 07:00.
+  ScheduleEngine:
+    Type: String
+    AllowedValues: [scheduler, events]
+    Default: scheduler
+    Description: >-
+      "scheduler" usa EventBridge Scheduler y requiere que LabRole confíe en
+      scheduler.amazonaws.com. Si el Learner Lab lo rechaza, usa "events" (regla de EventBridge).
+
+Rules:
+  SoloRegionesDelLab:
+    Assertions:
+      - Assert:
+          Fn::Contains:
+            - [us-east-1, us-west-2]
+            - !Ref AWS::Region
+        AssertDescription: Solo se permite us-east-1 y us-west-2 (Learner Lab).
+
+Conditions:
+  UseSqs: !Equals [!Ref SourceKind, sqs]
+  UseDynamo: !Equals [!Ref SourceKind, dynamodb]
+  UseScheduler: !Equals [!Ref ScheduleEngine, scheduler]
+  UseEventsRule: !Equals [!Ref ScheduleEngine, events]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Handler: app.handler
+    Architectures: [x86_64]
+    Tags:
+      proyecto: arquifusion
+      env: !Ref Env
+
+Resources:
+  # --- 1. Puente AWS -> Google Pub/Sub ----------------------------------------
+  BridgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/af-${Env}-bridge-pubsub
+      RetentionInDays: 14
+
+  BridgeFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: BridgeLogGroup
+    Properties:
+      FunctionName: !Sub af-${Env}-bridge-pubsub
+      Description: Lee de SQS o DynamoDB Streams y publica en Pub/Sub (telemetry-raw).
+      CodeUri: ../../part-a/bridge/pubsub_bridge/
+      Role: !Ref LabRoleArn
+      MemorySize: 512
+      Timeout: 60
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          SSM_PREFIX: !Sub /arquifusion/${Env}
+          LOG_LEVEL: INFO
+
+  BridgeSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: UseSqs
+    Properties:
+      FunctionName: !Ref BridgeFunction
+      # SUPUESTO: nombre del parámetro SSM; confirmar contra /contract
+      EventSourceArn: !Sub "{{resolve:ssm:/arquifusion/${Env}/bridge/source-queue-arn}}"
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      Enabled: true
+
+  BridgeDynamoMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: UseDynamo
+    Properties:
+      FunctionName: !Ref BridgeFunction
+      # SUPUESTO: ARN del stream de la tabla; confirmar contra /contract
+      EventSourceArn: !Sub "{{resolve:ssm:/arquifusion/${Env}/bridge/source-stream-arn}}"
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      Enabled: true
+
+  # --- 2. Respaldo programado S3 -> Azure Blob (A10) ---------------------------
+  BackupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/af-${Env}-backup-azure
+      RetentionInDays: 14
+
+  BackupFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: BackupLogGroup
+    Properties:
+      FunctionName: !Sub af-${Env}-backup-azure
+      Description: Copia los Parquet nuevos de S3 a Azure Blob usando un SAS de Secrets Manager.
+      CodeUri: ../../part-a/backup/azure_backup/
+      Role: !Ref LabRoleArn
+      MemorySize: 512
+      Timeout: 900
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          SSM_PREFIX: !Sub /arquifusion/${Env}
+          LOOKBACK_HOURS: "36"
+          BLOB_PREFIX: af-backup/
+          LOG_LEVEL: INFO
+
+  BackupSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: UseScheduler
+    Properties:
+      Name: !Sub af-${Env}-backup-azure-schedule
+      Description: Dispara el respaldo a Azure.
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt BackupFunction.Arn
+        RoleArn: !Ref LabRoleArn
+        Input: '{"lookback_hours": 36}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+
+  BackupEventsRule:
+    Type: AWS::Events::Rule
+    Condition: UseEventsRule
+    Properties:
+      Name: !Sub af-${Env}-backup-azure-rule
+      Description: Alternativa a Scheduler si LabRole no puede ser asumido por scheduler.amazonaws.com.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: af-backup-azure
+          Arn: !GetAtt BackupFunction.Arn
+          Input: '{"lookback_hours": 36}'
+
+  BackupEventsPermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseEventsRule
+    Properties:
+      FunctionName: !Ref BackupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BackupEventsRule.Arn
+
+  # --- Nombres publicados en SSM (regla 4) -------------------------------------
+  BridgeFunctionNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/bridge/function-name
+      Type: String
+      Value: !Ref BridgeFunction
+      Description: Nombre de la Lambda del puente a Pub/Sub.
+      Tags:
+        proyecto: arquifusion
+        env: !Ref Env
+
+  BackupFunctionNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/backup/function-name
+      Type: String
+      Value: !Ref BackupFunction
+      Description: Nombre de la Lambda de respaldo a Azure.
+      Tags:
+        proyecto: arquifusion
+        env: !Ref Env
+
+Outputs:
+  BridgeFunctionName:
+    Value: !Ref BridgeFunction
+  BackupFunctionName:
+    Value: !Ref BackupFunction
+  BackupScheduleEngine:
+    Value: !Ref ScheduleEngine
