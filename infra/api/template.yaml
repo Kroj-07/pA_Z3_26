@@ -2,11 +2,16 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   ArquiFusion - Parte A - API REST /v1 (API Gateway + Lambdas + autorizador).
-  Endpoints: GET /machines, GET /alerts, GET /technicians, GET /incidents, POST /alerts (HMAC).
+  Lectura: /machines, /machines/{id}, /machines/{id}/telemetry, /machines/{id}/incidents, /alerts,
+  /technicians, /incidents, /inventory, /notifications. Escritura: POST /alerts (HMAC) y callbacks
+  POST /incidents/{id}/ack|start|close (reanudan SF-1). POST /telemetry NO es de este stack (IA-2).
   Todo corre con LabRole (Learner Lab), solo us-east-1 y us-west-2, sin servidores permanentes.
 
 # -----------------------------------------------------------------------------
 # Despliegue (orden: root -> persistencia -> events-template -> este stack)
+# Requiere en SSM: ddb/{machines,alerts,incidents,technicians,telemetry,inventory,notifications}-table
+# y events/bus-name. Indices esperados: Alerts by_zone_created y by_severity_created,
+# Incidents by_status y by_incident_id.
 #   sam build  -t infra/api/template.yaml
 #   sam deploy -t infra/api/template.yaml --stack-name af-dev-api \
 #       --parameter-overrides Env=dev --region us-east-1 --resolve-s3
@@ -58,6 +63,7 @@ Globals:
       Variables:
         ENV: !Ref Env
         LOG_LEVEL: INFO
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -154,8 +160,16 @@ Resources:
           TABLE_ALERTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/alerts-table}}'
           TABLE_TECHNICIANS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/technicians-table}}'
           TABLE_INCIDENTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/incidents-table}}'
+          TABLE_TELEMETRY: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/telemetry-table}}'
+          TABLE_INVENTORY: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/inventory-table}}'
+          TABLE_NOTIFICATIONS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/notifications-table}}'
+          ALERTS_ZONE_INDEX: by_zone_created
+          ALERTS_SEVERITY_INDEX: by_severity_created
+          INCIDENTS_STATUS_INDEX: by_status
           DEFAULT_PAGE_SIZE: '50'
           MAX_PAGE_SIZE: '200'
+          TELEMETRY_DEFAULT_PAGE_SIZE: '100'
+          TELEMETRY_MAX_PAGE_SIZE: '1000'
       Events:
         GetMachines:
           Type: Api
@@ -180,6 +194,36 @@ Resources:
           Properties:
             RestApiId: !Ref AfApi
             Path: /incidents
+            Method: get
+        GetMachineById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /machines/{machine_id}
+            Method: get
+        GetMachineTelemetry:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /machines/{machine_id}/telemetry
+            Method: get
+        GetMachineIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /machines/{machine_id}/incidents
+            Method: get
+        GetInventory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /inventory
+            Method: get
+        GetNotifications:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /notifications
             Method: get
 
   # ---------------------------------------------------------------------------
@@ -208,6 +252,39 @@ Resources:
             Method: post
             Auth:
               Authorizer: NONE
+
+  # ---------------------------------------------------------------------------
+  # Callbacks de incidentes: reanudan SF-1 (SendTaskSuccess) y actualizan el incidente
+  # ---------------------------------------------------------------------------
+  ApiCallbacksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'af-${Env}-api-callbacks'
+      Description: POST /incidents/{id}/ack|start|close (callbacks de Step Functions).
+      Handler: api.incident_callbacks.handler
+      Environment:
+        Variables:
+          TABLE_INCIDENTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/incidents-table}}'
+          INCIDENTS_BY_ID_INDEX: by_incident_id
+      Events:
+        PostIncidentAck:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /incidents/{incident_id}/ack
+            Method: post
+        PostIncidentStart:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /incidents/{incident_id}/start
+            Method: post
+        PostIncidentClose:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /incidents/{incident_id}/close
+            Method: post
 
   # ---------------------------------------------------------------------------
   # Autorizador Lambda (REQUEST). Se elige sobre Cognito porque el Learner Lab
@@ -240,6 +317,12 @@ Resources:
       LogGroupName: !Sub '/aws/lambda/af-${Env}-api-alerts'
       RetentionInDays: !Ref LogRetentionDays
 
+  ApiCallbacksLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/af-${Env}-api-callbacks'
+      RetentionInDays: !Ref LogRetentionDays
+
   AuthorizerLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -268,5 +351,7 @@ Outputs:
     Value: !GetAtt ApiReadFunction.Arn
   ApiAlertsFunctionArn:
     Value: !GetAtt ApiAlertsFunction.Arn
+  ApiCallbacksFunctionArn:
+    Value: !GetAtt ApiCallbacksFunction.Arn
   AuthorizerFunctionArn:
     Value: !GetAtt AuthorizerFunction.Arn
