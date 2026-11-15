@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >-
-  ArquiFusion Fleet Intelligence - Parte A - stack raíz (esqueleto).
+  ArquiFusion Fleet Intelligence - Parte A - stack raíz (anida todos los stacks de la Parte A).
   Publica la configuración común en SSM (/arquifusion/{env}/root/) y, cuando cada
   IA entregue su plantilla, anida sus stacks. Cuenta tratada como Learner Lab:
   todos los recursos usan LabRole, solo us-east-1 y us-west-2.
@@ -22,6 +22,44 @@ Parameters:
     Type: String
     Default: LabRole
     Description: Nombre del rol único del Learner Lab. Todos los recursos lo usan.
+  PandasLayerArn:
+    Type: String
+    Default: ""
+    Description: ARN de la capa AWS SDK for pandas (pyarrow). Ver scripts/resolve_pandas_layer.sh.
+  GcpProjectId:
+    Type: String
+    Default: pendiente
+    Description: Proyecto de Google Cloud (Parte B).
+  AzureContainerUrl:
+    Type: String
+    Default: https://pendiente.blob.core.windows.net/af-backup
+    Description: URL del contenedor de Azure Blob (sin SAS).
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Correo para las alarmas (vacío = sin suscripción).
+  SesSenderEmail:
+    Type: String
+    Default: ""
+    Description: Remitente verificado en SES (vacío = sin correo).
+  IncidentWorkflowArn:
+    Type: String
+    Default: ""
+    Description: ARN de SF-1 (Parte C). Vacío = la regla de incidentes no dispara nada.
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Origen CORS de la API (la app de la Parte C).
+  EnableGlobalTables:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Global Tables en Alerts e Incidents (solo en el primer despliegue; ver infra/data/README.md).
+  EnableReplication:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Replicación de S3 a la otra región (requiere el stack réplica desplegado antes).
 
 Rules:
   SoloRegionesDelLab:
@@ -68,33 +106,115 @@ Resources:
         proyecto: arquifusion
         env: !Ref Env
 
-  # --- Stacks anidados (descomentar cuando cada IA entregue su plantilla) -----
-  # Las rutas son una propuesta y cada IA debe confirmar la suya. Con
-  # `sam deploy` o `aws cloudformation package` las rutas locales se suben a S3.
-  # Pasar siempre Env y LabRoleArn: nada de nombres de recursos escritos a mano;
-  # los nombres se publican en SSM /arquifusion/{env}/ con prefijo af-.
-  #
-  # IngestStack:
-  #   Type: AWS::CloudFormation::Stack
-  #   DependsOn: LabRoleArnParameter
-  #   Properties:
-  #     TemplateURL: ../../part-a/ingest/template.yaml
-  #     Parameters:
-  #       Env: !Ref Env
-  #       LabRoleArn: !GetAtt LabRoleArnParameter.Value
-  #     Tags:
-  #       - { Key: proyecto, Value: arquifusion }
-  #       - { Key: env, Value: !Ref Env }
-  #
-  # DataStack:        # tablas DynamoDB, S3, replicación (infra/data)
-  # ApiStack:         # API REST /v1 (part-a/api)
-  # BridgeStack:      # puente a Pub/Sub (part-a/bridge, infra/bridge)
-  # Sf2Stack:         # pipeline analítico diario (part-a/sf2)
-  # BackupStack:      # respaldo a Azure Blob, A10 (part-a/backup)
-  # EventsStack:      # EventBridge y notificaciones (part-a/events)
-  # ObservabilityStack: # CloudWatch y X-Ray (part-a/observability)
+  # --- Stacks anidados (orden: seguridad y datos primero; observabilidad al final) ------
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [EnvParameter]
+    Properties:
+      TemplateURL: ../security/template.yaml
+      Parameters:
+        Env: !Ref Env
+        GcpProjectId: !Ref GcpProjectId
+        AzureContainerUrl: !Ref AzureContainerUrl
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
+  DataStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [LabRoleArnParameter]
+    Properties:
+      TemplateURL: ../data/template.yaml
+      Parameters:
+        Env: !Ref Env
+        LabRoleArn: !GetAtt LabRoleArnParameter.Value
+        EnableGlobalTables: !Ref EnableGlobalTables
+        EnableReplication: !Ref EnableReplication
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
+  IngestStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [DataStack, SecurityStack]
+    Properties:
+      TemplateURL: ../ingest/template.yaml
+      Parameters:
+        Env: !Ref Env
+        LabRoleName: !Ref LabRoleName
+        PandasLayerArn: !Ref PandasLayerArn
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
+  EventsStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [DataStack]
+    Properties:
+      TemplateURL: ../api/events-template.yaml
+      Parameters:
+        Env: !Ref Env
+        LabRoleName: !Ref LabRoleName
+        SesSenderEmail: !Ref SesSenderEmail
+        IncidentWorkflowArn: !Ref IncidentWorkflowArn
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
+  ApiStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [DataStack, SecurityStack, EventsStack]
+    Properties:
+      TemplateURL: ../api/template.yaml
+      Parameters:
+        Env: !Ref Env
+        LabRoleName: !Ref LabRoleName
+        AllowedOrigin: !Ref AllowedOrigin
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
+  BridgeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [DataStack, SecurityStack]
+    Properties:
+      TemplateURL: ../bridge/template.yaml
+      Parameters:
+        Env: !Ref Env
+        LabRoleArn: !GetAtt LabRoleArnParameter.Value
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
+  Sf2Stack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [DataStack, BridgeStack]
+    Properties:
+      TemplateURL: ../../part-a/sf2/template.yaml
+      Parameters:
+        Env: !Ref Env
+        LabRoleArn: !GetAtt LabRoleArnParameter.Value
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: [IngestStack, Sf2Stack]
+    Properties:
+      TemplateURL: ../../part-a/observability/template.yaml
+      Parameters:
+        Env: !Ref Env
+        AlarmEmail: !Ref AlarmEmail
+      Tags:
+          - { Key: proyecto, Value: arquifusion }
+          - { Key: env, Value: !Ref Env }
+
 
 Outputs:
+  IngestUrl:
+    Description: POST de telemetria (Authorization Bearer de rol admin).
+    Value: !GetAtt IngestStack.Outputs.IngestUrl
   Env:
     Description: Entorno desplegado.
     Value: !Ref Env

@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  ArquiFusion Fleet Intelligence - Parte A - secretos (Secrets Manager) y configuración
+  no secreta (SSM). Sin IAM: todo corre con LabRole. Cifrado por defecto del servicio.
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [shared, test]
+    Default: test
+  GcpProjectId:
+    Type: String
+    Default: pendiente
+    Description: Proyecto de Google Cloud (lo da la Parte B). Se puede cambiar luego en SSM.
+  PubsubTopic:
+    Type: String
+    Default: telemetry-raw
+    Description: Tópico de Pub/Sub donde publica el puente (contrato 6.12).
+  AzureContainerUrl:
+    Type: String
+    Default: https://pendiente.blob.core.windows.net/af-backup
+    Description: URL del contenedor de Azure Blob, sin SAS.
+
+Rules:
+  SoloRegionesDelLab:
+    Assertions:
+      - Assert: !Contains [[us-east-1, us-west-2], !Ref "AWS::Region"]
+        AssertDescription: Solo se permite us-east-1 o us-west-2 (Learner Lab).
+
+Resources:
+  # --- Secretos --------------------------------------------------------------
+  # Valor generado al desplegar; nunca pasa por el repositorio.
+  AlertHmacSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub arquifusion/${Env}/alert-hmac
+      Description: Secreto HMAC compartido con Cloud Run (B) para firmar POST /v1/alerts.
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  JwtSigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub arquifusion/${Env}/jwt-signing
+      Description: Clave HS256 del autorizador Lambda (API REST y API HTTP de ingesta).
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # Marcadores: se llenan con scripts/set_secrets.sh (valores que vienen de Azure y GCP).
+  AzureSasSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub arquifusion/${Env}/azure-sas
+      Description: Token SAS de Azure Blob (expiración corta). Se llena con scripts/set_secrets.sh.
+      SecretString: REEMPLAZAR
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  GcpPubsubKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub arquifusion/${Env}/gcp-pubsub-key
+      Description: JSON de la cuenta de servicio de GCP (solo publicar en Pub/Sub). Se llena con scripts/set_secrets.sh.
+      SecretString: REEMPLAZAR
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # --- Configuración no secreta en SSM ----------------------------------------
+  GcpSecretNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/bridge/gcp-secret-name
+      Type: String
+      Value: !Sub arquifusion/${Env}/gcp-pubsub-key
+      Description: Nombre del secreto con la clave de GCP (lo lee el puente).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  GcpProjectIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/bridge/gcp-project-id
+      Type: String
+      Value: !Ref GcpProjectId
+      Description: Proyecto de Google Cloud.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  PubsubTopicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/bridge/pubsub-topic
+      Type: String
+      Value: !Ref PubsubTopic
+      Description: Tópico de Pub/Sub.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  SasSecretNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/backup/sas-secret-name
+      Type: String
+      Value: !Sub arquifusion/${Env}/azure-sas
+      Description: Nombre del secreto con el SAS de Azure (respaldo A10).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  AzureContainerUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/backup/azure-container-url
+      Type: String
+      Value: !Ref AzureContainerUrl
+      Description: URL del contenedor de Azure Blob (sin SAS).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  HmacSecretNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/security/alert-hmac-secret-name
+      Type: String
+      Value: !Sub arquifusion/${Env}/alert-hmac
+      Description: Nombre del secreto HMAC de alertas.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  JwtSecretNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/security/jwt-secret-name
+      Type: String
+      Value: !Sub arquifusion/${Env}/jwt-signing
+      Description: Nombre del secreto de firma JWT.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+Outputs:
+  AlertHmacSecretArn:
+    Value: !Ref AlertHmacSecret
+  JwtSigningSecretArn:
+    Value: !Ref JwtSigningSecret
+  AzureSasSecretArn:
+    Value: !Ref AzureSasSecret
+  GcpPubsubKeySecretArn:
+    Value: !Ref GcpPubsubKeySecret

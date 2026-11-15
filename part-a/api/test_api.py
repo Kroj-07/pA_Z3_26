@@ -303,14 +303,14 @@ class PaginationTests(AppTestCase):
         self.assertEqual(ids, [r["alert_id"] for r in rows])
         kind, kwargs = self.tables["TABLE_ALERTS"].calls[0]
         self.assertEqual(kind, "query")
-        self.assertEqual(kwargs["IndexName"], "by_zone_created")
+        self.assertEqual(kwargs["IndexName"], "zone_id-created_at-index")
         self.assertFalse(kwargs["ScanIndexForward"])  # mas recientes primero
 
     def test_filtros_que_no_dan_clave_se_aplican_como_filtro(self):
         self.tables["TABLE_ALERTS"] = FakeTable(alert_rows(1), ("machine_id", "created_at"))
         self.get("/alerts", {"severity": "high"})
         _, kwargs = self.tables["TABLE_ALERTS"].calls[0]
-        self.assertEqual(kwargs["IndexName"], "by_severity_created")
+        self.assertEqual(kwargs["IndexName"], "severity-created_at-index")
         self.assertNotIn("FilterExpression", kwargs)  # la severidad ya es la clave del indice
 
     def test_token_de_otra_consulta_se_rechaza(self):
@@ -826,6 +826,43 @@ class NotifierTests(unittest.TestCase):
     def test_resumen_con_periodo_invalido(self):
         with self.assertRaises(ValueError):
             notifier.handler({"mode": "digest", "period": "cada-minuto"})
+
+
+class IngestAuthorizerTests(unittest.TestCase):
+    """handler_http: autorizador del API HTTP de ingesta (solo rol admin)."""
+
+    def setUp(self):
+        self._saved = authorizer.get_secret
+        authorizer.get_secret = lambda: "clave-de-prueba"
+
+    def tearDown(self):
+        authorizer.get_secret = self._saved
+
+    @staticmethod
+    def _event(token=None):
+        return {"headers": {"authorization": "Bearer " + token} if token else {}}
+
+    @staticmethod
+    def _token(role, exp_delta=300):
+        return mint_token.mint("clave-de-prueba", {"sub": "gen", "role": role, "exp": int(time.time()) + exp_delta})
+
+    def test_admin_autorizado(self):
+        out = authorizer.handler_http(self._event(self._token("admin")))
+        self.assertTrue(out["isAuthorized"])
+        self.assertEqual(out["context"]["role"], "admin")
+
+    def test_otros_roles_rechazados(self):
+        for role in ("operator", "technician", "maintenance", "supervisor", "management"):
+            self.assertFalse(authorizer.handler_http(self._event(self._token(role)))["isAuthorized"], role)
+
+    def test_sin_token_o_invalido_o_vencido(self):
+        self.assertFalse(authorizer.handler_http(self._event())["isAuthorized"])
+        self.assertFalse(authorizer.handler_http(self._event("a.b.c"))["isAuthorized"])
+        self.assertFalse(authorizer.handler_http(self._event(self._token("admin", -10)))["isAuthorized"])
+
+    def test_firma_de_otra_clave(self):
+        bad = mint_token.mint("otra-clave", {"sub": "x", "role": "admin", "exp": int(time.time()) + 60})
+        self.assertFalse(authorizer.handler_http(self._event(bad))["isAuthorized"])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Pruebas de hmac_utils. Se ejecutan con:  python -m unittest -v  (desde part-a/shared)
+"""Pruebas de hmac_utils. Se ejecutan con:  python -m unittest -v  (desde part-a/shared) o  python -m unittest shared.test_hmac_utils  (desde part-a)
 
 Usan un secreto de mentira que solo existe en estas pruebas.
 """
@@ -6,15 +6,26 @@ Usan un secreto de mentira que solo existe en estas pruebas.
 import unittest
 from datetime import datetime, timezone
 
-from hmac_utils import (
-    SIGNATURE_HEADER,
-    TIMESTAMP_HEADER,
-    WINDOW_SECONDS,
-    build_headers,
-    extract_hmac_headers,
-    sign_hmac,
-    verify_hmac,
-)
+try:  # desde part-a:  python -m unittest shared.test_hmac_utils
+    from shared.hmac_utils import (
+        SIGNATURE_HEADER,
+        TIMESTAMP_HEADER,
+        WINDOW_SECONDS,
+        build_headers,
+        extract_hmac_headers,
+        sign_hmac,
+        verify_hmac,
+    )
+except ImportError:  # desde part-a/shared:  python -m unittest
+    from hmac_utils import (
+        SIGNATURE_HEADER,
+        TIMESTAMP_HEADER,
+        WINDOW_SECONDS,
+        build_headers,
+        extract_hmac_headers,
+        sign_hmac,
+        verify_hmac,
+    )
 
 SECRET = "secreto-solo-para-pruebas"
 BODY = b'{"alert_id":"ALT-000812","machine_id":"MCH-000123"}'

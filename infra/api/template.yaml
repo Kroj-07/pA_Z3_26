@@ -10,8 +10,8 @@ Description: >
 # -----------------------------------------------------------------------------
 # Despliegue (orden: root -> persistencia -> events-template -> este stack)
 # Requiere en SSM: ddb/{machines,alerts,incidents,technicians,telemetry,inventory,notifications}-table
-# y events/bus-name. Indices esperados: Alerts by_zone_created y by_severity_created,
-# Incidents by_status y by_incident_id.
+# y events/bus-name. Indices esperados: Alerts zone_id-created_at-index y severity-created_at-index,
+# Incidents status-opened_at-index y incident_id-index.
 #   sam build  -t infra/api/template.yaml
 #   sam deploy -t infra/api/template.yaml --stack-name af-dev-api \
 #       --parameter-overrides Env=dev --region us-east-1 --resolve-s3
@@ -22,9 +22,9 @@ Description: >
 Parameters:
   Env:
     Type: String
-    Default: dev
-    AllowedPattern: '^[a-z0-9]{2,8}$'
-    Description: Entorno (dev, test...). Se usa en nombres af-{env}-* y en /arquifusion/{env}/.
+    AllowedValues: [shared, test]
+    Default: test
+    Description: Entorno. shared es el compartido; test el de pruebas (nombres af-{env}-* y /arquifusion/{env}/).
   LabRoleName:
     Type: String
     Default: LabRole
@@ -156,16 +156,16 @@ Resources:
       Handler: api.app.handler
       Environment:
         Variables:
-          TABLE_MACHINES: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/machines-table}}'
-          TABLE_ALERTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/alerts-table}}'
-          TABLE_TECHNICIANS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/technicians-table}}'
-          TABLE_INCIDENTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/incidents-table}}'
-          TABLE_TELEMETRY: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/telemetry-table}}'
-          TABLE_INVENTORY: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/inventory-table}}'
-          TABLE_NOTIFICATIONS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/notifications-table}}'
-          ALERTS_ZONE_INDEX: by_zone_created
-          ALERTS_SEVERITY_INDEX: by_severity_created
-          INCIDENTS_STATUS_INDEX: by_status
+          TABLE_MACHINES: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/machines-table}}'
+          TABLE_ALERTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/alerts-table}}'
+          TABLE_TECHNICIANS: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/technicians-table}}'
+          TABLE_INCIDENTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/incidents-table}}'
+          TABLE_TELEMETRY: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/telemetry-table}}'
+          TABLE_INVENTORY: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/inventory-table}}'
+          TABLE_NOTIFICATIONS: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/notifications-table}}'
+          ALERTS_ZONE_INDEX: zone_id-created_at-index
+          ALERTS_SEVERITY_INDEX: severity-created_at-index
+          INCIDENTS_STATUS_INDEX: status-opened_at-index
           DEFAULT_PAGE_SIZE: '50'
           MAX_PAGE_SIZE: '200'
           TELEMETRY_DEFAULT_PAGE_SIZE: '100'
@@ -239,7 +239,7 @@ Resources:
       Handler: api.alerts.handler
       Environment:
         Variables:
-          TABLE_ALERTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/alerts-table}}'
+          TABLE_ALERTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/alerts-table}}'
           EVENT_BUS_NAME: !Sub '{{resolve:ssm:/arquifusion/${Env}/events/bus-name}}'
           HMAC_SECRET_ID: !Sub 'arquifusion/${Env}/alert-hmac'
           HMAC_MAX_SKEW_SECONDS: '300'
@@ -264,8 +264,8 @@ Resources:
       Handler: api.incident_callbacks.handler
       Environment:
         Variables:
-          TABLE_INCIDENTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/incidents-table}}'
-          INCIDENTS_BY_ID_INDEX: by_incident_id
+          TABLE_INCIDENTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/data/incidents-table}}'
+          INCIDENTS_BY_ID_INDEX: incident_id-index
       Events:
         PostIncidentAck:
           Type: Api

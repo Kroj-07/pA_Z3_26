@@ -12,7 +12,7 @@ Sube por bloques de 8 MB leyendo S3 en streaming; no necesita SDK de Azure
 Configuración (regla 4):
   Variables de entorno: ENV, SSM_PREFIX (opc.), LOOKBACK_HOURS (opc.), BLOB_PREFIX (opc.)
   Parámetros SSM (SUPUESTO: confirmar contra /contract):
-    {SSM_PREFIX}/data/parquet-bucket        -> bucket S3 con los Parquet de la IA-2
+    {SSM_PREFIX}/data/telemetry-bucket        -> bucket S3 con los Parquet de la IA-2
     {SSM_PREFIX}/backup/source-prefix       -> prefijo S3 a respaldar (opcional, "" por defecto)
     {SSM_PREFIX}/backup/azure-container-url -> https://<cuenta>.blob.core.windows.net/<contenedor>
     {SSM_PREFIX}/backup/sas-secret-name     -> nombre del secreto con el token SAS
@@ -33,7 +33,7 @@ import boto3
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
-ENV = os.environ.get("ENV", "dev")
+ENV = os.environ.get("ENV", "test")
 SSM_PREFIX = os.environ.get("SSM_PREFIX", f"/arquifusion/{ENV}").rstrip("/")
 LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "36"))
 BLOB_PREFIX = os.environ.get("BLOB_PREFIX", "af-backup/")
@@ -61,7 +61,7 @@ def _config():
     if not _cfg:
         sas = _sm.get_secret_value(SecretId=_param("backup/sas-secret-name"))["SecretString"]
         _cfg.update(
-            bucket=_param("data/parquet-bucket"),
+            bucket=_param("data/telemetry-bucket"),
             source_prefix=_param("backup/source-prefix", default=""),
             container_url=_param("backup/azure-container-url").rstrip("/"),
             sas=sas.strip().lstrip("?"),

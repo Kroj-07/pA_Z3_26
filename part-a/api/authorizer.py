@@ -165,3 +165,29 @@ def handler(event, context=None):
         logger.info("token rechazado: %s", exc)  # nunca se registra el token
         raise Exception("Unauthorized")  # noqa: TRY002
     return build_policy(claims, event.get("methodArn", ""))
+
+
+# Roles que pueden enviar telemetria a POST /v1/telemetry (generador de flota de la Parte B y
+# scripts de carga de la Parte C). Se usa un JWT del rol admin: ``mint_token.py --role admin``.
+INGEST_ROLES = ("admin",)
+
+
+def handler_http(event, context=None):
+    """Autorizador del API HTTP de ingesta (payload 2.0, respuesta simple).
+
+    Mismo JWT HS256 y mismo secreto (``arquifusion/{env}/jwt-signing``) que el API REST, pero
+    solo deja pasar a los roles de INGEST_ROLES. Devuelve ``{"isAuthorized": bool}``; un token
+    ausente o invalido da 403 en API Gateway (los API HTTP no distinguen 401 con respuesta simple).
+    """
+    token = _bearer(event)
+    if not token:
+        return {"isAuthorized": False}
+    try:
+        claims = verify_jwt(token, get_secret())
+    except Unauthorized as exc:
+        logger.info("token rechazado (ingesta): %s", exc)  # nunca se registra el token
+        return {"isAuthorized": False}
+    if claims.get("role") not in INGEST_ROLES:
+        logger.info("rol sin permiso de ingesta: %s", claims.get("role"))
+        return {"isAuthorized": False}
+    return {"isAuthorized": True, "context": {"sub": str(claims["sub"]), "role": claims["role"]}}

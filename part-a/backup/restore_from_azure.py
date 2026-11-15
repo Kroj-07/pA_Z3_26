@@ -9,7 +9,7 @@ sube a S3 con la misma clave. Salta los que ya existen con el mismo tamaño
 (usa --overwrite para forzar). Descarga en streaming: no llena disco ni memoria.
 
 Configuración (mismos nombres que el Lambda de respaldo; SUPUESTO: confirmar contra /contract):
-  SSM  /arquifusion/{env}/data/parquet-bucket          -> bucket destino (o --bucket)
+  SSM  /arquifusion/{env}/data/telemetry-bucket          -> bucket destino (o --bucket)
   SSM  /arquifusion/{env}/backup/azure-container-url   -> URL del contenedor (o --container-url)
   SSM  /arquifusion/{env}/backup/sas-secret-name       -> secreto con el SAS
   Para pruebas locales: variable de entorno AZURE_SAS_TOKEN (nunca la subas al repo).
@@ -84,7 +84,7 @@ def main():
     p = argparse.ArgumentParser(description="Restaura Parquet desde Azure Blob a S3.")
     p.add_argument("--env", required=True, choices=["shared", "test"])
     p.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"), choices=ALLOWED_REGIONS)
-    p.add_argument("--bucket", help="Bucket S3 destino (si no, SSM data/parquet-bucket)")
+    p.add_argument("--bucket", help="Bucket S3 destino (si no, SSM data/telemetry-bucket)")
     p.add_argument("--container-url", help="URL del contenedor Azure (si no, SSM backup/azure-container-url)")
     p.add_argument("--blob-prefix", default="af-backup/", help="Prefijo usado por el respaldo")
     p.add_argument("--prefix", default="", help="Filtra por prefijo relativo (p. ej. 2026/11/)")
@@ -102,7 +102,7 @@ def main():
 
     try:
         ssm = boto3.client("ssm", region_name=args.region)
-        bucket = args.bucket or get_ssm(ssm, args.env, "data/parquet-bucket")
+        bucket = args.bucket or get_ssm(ssm, args.env, "data/telemetry-bucket")
         container = (args.container_url or get_ssm(ssm, args.env, "backup/azure-container-url")).rstrip("/")
         sas = os.environ.get("AZURE_SAS_TOKEN")
         if not sas:

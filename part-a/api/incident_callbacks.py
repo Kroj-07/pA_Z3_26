@@ -10,7 +10,7 @@ SF-1 (Parte C) guarda en el item del incidente los tokens de callback ``ack_task
 ``SendTaskSuccess`` y se actualiza el item. Los tokens NUNCA se devuelven al cliente.
 
 Convenciones propuestas al contrato (por confirmar con C / IA-2):
-  - Incidents necesita un GSI ``by_incident_id`` (PK incident_id) para buscar por id.
+  - Incidents necesita un GSI ``incident_id-index`` (PK incident_id) para buscar por id.
   - Atributos nuevos del incidente: ack_task_token, close_task_token, acknowledged_at,
     acknowledged_by, started_at, close_requested_at, closed_by.
   - /close NO pone status=closed: lo hace SF-1 despues de descontar repuestos
@@ -115,7 +115,7 @@ def validate_close(data):
 
 
 def find_incident(incident_id):
-    index = os.environ.get("INCIDENTS_BY_ID_INDEX", "by_incident_id")
+    index = os.environ.get("INCIDENTS_BY_ID_INDEX", "incident_id-index")
     resp = get_table().query(
         IndexName=index,
         KeyConditionExpression="incident_id = :i",

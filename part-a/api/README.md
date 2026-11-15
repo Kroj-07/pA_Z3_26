@@ -95,10 +95,10 @@ si cambia un valor en SSM, porque los nombres se resuelven al desplegar.
 
 - Todas: `ENV`, `LOG_LEVEL`, `ALLOWED_ORIGIN`.
 - `api-read`: `TABLE_MACHINES|ALERTS|INCIDENTS|TECHNICIANS|TELEMETRY|INVENTORY|NOTIFICATIONS` (de SSM),
-  `ALERTS_ZONE_INDEX=by_zone_created`, `ALERTS_SEVERITY_INDEX=by_severity_created`, `INCIDENTS_STATUS_INDEX=by_status`,
+  `ALERTS_ZONE_INDEX=zone_id-created_at-index`, `ALERTS_SEVERITY_INDEX=severity-created_at-index`, `INCIDENTS_STATUS_INDEX=status-opened_at-index`,
   `MACHINES_BY_ZONE_INDEX` (opcional), `DEFAULT_PAGE_SIZE`, `MAX_PAGE_SIZE`, `TELEMETRY_DEFAULT_PAGE_SIZE`, `TELEMETRY_MAX_PAGE_SIZE`.
 - `api-alerts`: `TABLE_ALERTS`, `EVENT_BUS_NAME` (SSM), `HMAC_SECRET_ID=arquifusion/{env}/alert-hmac`, `HMAC_MAX_SKEW_SECONDS=300`.
-- `api-callbacks`: `TABLE_INCIDENTS`, `INCIDENTS_BY_ID_INDEX=by_incident_id`.
+- `api-callbacks`: `TABLE_INCIDENTS`, `INCIDENTS_BY_ID_INDEX=incident_id-index`.
 - `api-authorizer`: `JWT_SECRET_ID=arquifusion/{env}/jwt-signing`.
 - `notifier`: `TABLE_NOTIFICATIONS`, `DIGEST_INDEX`, `TOPIC_{ROL}`, `SES_SENDER` (vacío = sin correo), `SSM_PREFIX`,
   `MASSIVE_MIN_MACHINES`, `NOTIFICATION_TTL_DAYS`.
@@ -117,9 +117,9 @@ Códigos `UNAUTHORIZED` (401) y `FORBIDDEN` (403); secreto `jwt-signing`; claves
 
 ## Propuestas nuevas, por confirmar
 
-1. **Persistencia (IA-2) - índices y atributos que la API da por hechos:** Alerts: GSI `by_zone_created` (zone_id, created_at) y
-   `by_severity_created` (severity, created_at); atributos `status` (open/acknowledged/resolved) y `event_published`.
-   Incidents: GSI `by_status` (status, opened_at) y `by_incident_id` (incident_id); atributo `zone_id` desnormalizado.
+1. **Persistencia (IA-2) - índices y atributos que la API da por hechos:** Alerts: GSI `zone_id-created_at-index` (zone_id, created_at) y
+   `severity-created_at-index` (severity, created_at); atributos `status` (open/acknowledged/resolved) y `event_published`.
+   Incidents: GSI `status-opened_at-index` (status, opened_at) y `incident_id-index` (incident_id); atributo `zone_id` desnormalizado.
    Tablas Telemetry e Inventory publicadas en SSM como `ddb/telemetry-table` y `ddb/inventory-table`.
 2. **Incidentes (C, SF-1):** guarda `ack_task_token` y `close_task_token` en el item; `/close` NO pone `closed`
    (lo hace SF-1 tras descontar repuestos); atributos `acknowledged_at`, `started_at`, `close_requested_at`.

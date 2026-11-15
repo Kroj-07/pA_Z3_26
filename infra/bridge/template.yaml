@@ -20,7 +20,7 @@ Parameters:
   SourceKind:
     Type: String
     AllowedValues: [sqs, dynamodb]
-    Default: sqs
+    Default: dynamodb
     Description: Fuente que alimenta el puente. Su ARN se lee de SSM (ver README).
   ScheduleExpression:
     Type: String

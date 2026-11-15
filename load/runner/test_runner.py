@@ -7,8 +7,8 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import chaos_sqs  # noqa: E402
-import load_test  # noqa: E402
+import load.runner.chaos_sqs as chaos_sqs  # noqa: E402
+import load.runner.load_test as load_test  # noqa: E402
 
 
 class Handler(BaseHTTPRequestHandler):

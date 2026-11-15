@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  ArquiFusion Fleet Intelligence - Parte A - ingesta: API Gateway HTTP -> SQS (+DLQ) -> Lambda
+  (valida, idempotente, enriquece; DynamoDB + S3 Parquet). Todo con LabRole, sin IAM propio.
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [shared, test]
+    Default: test
+  LabRoleName:
+    Type: String
+    Default: LabRole
+  PandasLayerArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN de la capa publica AWS SDK for pandas (trae pyarrow), python3.12 arm64. Obtenerlo con
+      scripts/resolve_pandas_layer.sh. Vacio = sin capa (la ingesta fallara al escribir Parquet).
+  MaxConcurrency:
+    Type: Number
+    Default: 50
+    MinValue: 2
+    MaxValue: 1000
+    Description: Tope de ejecuciones simultaneas de la Lambda (protege el credito del Lab).
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    Description: Intentos antes de enviar un mensaje a la DLQ.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Conditions:
+  HasLayer: !Not [!Equals [!Ref PandasLayerArn, ""]]
+
+Rules:
+  SoloRegionesDelLab:
+    Assertions:
+      - Assert: !Contains [[us-east-1, us-west-2], !Ref "AWS::Region"]
+        AssertDescription: Solo se permite us-east-1 o us-west-2 (Learner Lab).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Role: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}"
+    Tracing: Active
+    Tags:
+      proyecto: arquifusion
+      env: !Ref Env
+      Part: A
+
+Resources:
+  # --- Cola y DLQ --------------------------------------------------------------
+  IngestDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub af-${Env}-ingest-dlq
+      MessageRetentionPeriod: 1209600  # 14 dias
+      SqsManagedSseEnabled: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub af-${Env}-ingest
+      VisibilityTimeout: 180  # >= 6 x Timeout de la Lambda (30 s)
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDlq.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # --- Lambda de ingesta ---------------------------------------------------------
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/af-${Env}-ingest
+      RetentionInDays: !Ref LogRetentionDays
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: IngestLogGroup
+    Properties:
+      FunctionName: !Sub af-${Env}-ingest
+      Description: Valida, deduplica y guarda telemetria (DynamoDB caliente + S3 Parquet).
+      CodeUri: ../../part-a/ingest/
+      Handler: app.lambda_handler
+      MemorySize: 512
+      Timeout: 30
+      Layers: !If [HasLayer, [!Ref PandasLayerArn], !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          LOG_LEVEL: INFO
+          TTL_DAYS: "30"
+          TELEMETRY_TABLE: !Sub "{{resolve:ssm:/arquifusion/${Env}/data/telemetry-table}}"
+          MACHINES_TABLE: !Sub "{{resolve:ssm:/arquifusion/${Env}/data/machines-table}}"
+          TELEMETRY_BUCKET: !Sub "{{resolve:ssm:/arquifusion/${Env}/data/telemetry-bucket}}"
+
+  IngestSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref IngestFunction
+      EventSourceArn: !GetAtt IngestQueue.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 2
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: !Ref MaxConcurrency
+      Enabled: true
+
+  # --- Autorizador del API HTTP (JWT, rol admin) -----------------------------------
+  IngestAuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/af-${Env}-ingest-authorizer
+      RetentionInDays: !Ref LogRetentionDays
+
+  IngestAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: IngestAuthorizerLogGroup
+    Properties:
+      FunctionName: !Sub af-${Env}-ingest-authorizer
+      Description: Autorizador Lambda (JWT HS256) del API HTTP de ingesta; solo rol admin.
+      CodeUri: ../../part-a/
+      Handler: api.authorizer.handler_http
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          LOG_LEVEL: INFO
+          JWT_SECRET_ID: !Sub arquifusion/${Env}/jwt-signing
+
+  # --- API Gateway HTTP: POST /v1/telemetry -> SQS (sin Lambda intermedia) ---------
+  IngestApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub af-${Env}-ingest-api
+      ProtocolType: HTTP
+      Description: Ingesta de telemetria por lotes (contrato 6.2).
+      Tags:
+        proyecto: arquifusion
+        env: !Ref Env
+
+  IngestAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref IngestApi
+      Name: af-jwt-admin
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: "2.0"
+      EnableSimpleResponses: true
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: ["$request.header.Authorization"]
+      AuthorizerUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestAuthorizerFunction.Arn}/invocations
+
+  IngestAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestAuthorizerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${IngestApi}/authorizers/${IngestAuthorizer}
+
+  SqsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref IngestApi
+      IntegrationType: AWS_PROXY
+      IntegrationSubtype: SQS-SendMessage
+      PayloadFormatVersion: "1.0"
+      CredentialsArn: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}
+      RequestParameters:
+        QueueUrl: !Ref IngestQueue
+        MessageBody: $request.body
+
+  TelemetryRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref IngestApi
+      RouteKey: POST /v1/telemetry
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref IngestAuthorizer
+      Target: !Sub integrations/${SqsIntegration}
+
+  IngestStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref IngestApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5000
+        ThrottlingRateLimit: 2000
+      Tags:
+        proyecto: arquifusion
+        env: !Ref Env
+
+  # --- Parametros SSM (los leen observabilidad, scripts y la Parte C) ----------------
+  FunctionNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/function-name
+      Type: String
+      Value: !Ref IngestFunction
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  ConsumerFunctionNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/consumer-function-name
+      Type: String
+      Value: !Ref IngestFunction
+      Description: Consumidor de la cola (la prueba de caos lo apaga con concurrencia reservada 0).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  QueueNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/queue-name
+      Type: String
+      Value: !GetAtt IngestQueue.QueueName
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  QueueUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/queue-url
+      Type: String
+      Value: !Ref IngestQueue
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  QueueArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/queue-arn
+      Type: String
+      Value: !GetAtt IngestQueue.Arn
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  DlqNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/dlq-name
+      Type: String
+      Value: !GetAtt IngestDlq.QueueName
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  DlqArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/dlq-arn
+      Type: String
+      Value: !GetAtt IngestDlq.Arn
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  MappingUuidParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/mapping-uuid
+      Type: String
+      Value: !Ref IngestSqsMapping
+      Description: UUID del event source mapping (la prueba de caos lo desactiva y reactiva).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  ApiUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/ingest/api-url
+      Type: String
+      Value: !Sub https://${IngestApi}.execute-api.${AWS::Region}.amazonaws.com
+      Description: Base URL del API HTTP de ingesta (POST /v1/telemetry).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+Outputs:
+  IngestUrl:
+    Description: URL para POST de telemetria (con Authorization Bearer de rol admin).
+    Value: !Sub https://${IngestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/telemetry
+  QueueUrl:
+    Value: !Ref IngestQueue
+  DlqUrl:
+    Value: !Ref IngestDlq

@@ -1,9 +1,9 @@
 """Genera un JWT HS256 para probar la API (demo / pruebas). No es parte de ninguna Lambda.
 
 Uso (con credenciales del Learner Lab ya cargadas en el entorno):
-  python part-a/api/mint_token.py --env dev --role maintenance --sub maria --zone ZONA-NORTE-02
-  python part-a/api/mint_token.py --env dev --role operator --sub luis --machines MCH-000123,MCH-000124
-  python part-a/api/mint_token.py --env dev --role technician --sub TEC-0007 --technician-id TEC-0007 --zone ZONA-NORTE-02
+  python part-a/api/mint_token.py --env test --role maintenance --sub maria --zone ZONA-NORTE-02
+  python part-a/api/mint_token.py --env test --role operator --sub luis --machines MCH-000123,MCH-000124
+  python part-a/api/mint_token.py --env test --role technician --sub TEC-0007 --technician-id TEC-0007 --zone ZONA-NORTE-02
 
 Sin acceso a AWS se puede pasar el secreto por variable de entorno JWT_SECRET (solo para pruebas
 locales; nunca lo guardes en el repositorio).
@@ -49,7 +49,7 @@ def load_secret(env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--env", default="dev")
+    parser.add_argument("--env", default="test")
     parser.add_argument("--role", required=True, choices=ROLES)
     parser.add_argument("--sub", required=True)
     parser.add_argument("--zone")

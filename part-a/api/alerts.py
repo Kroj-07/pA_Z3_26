@@ -118,18 +118,23 @@ def get_hmac_secret():
 
 
 def verify_signature(secret, timestamp, body, signature):
+    """Verifica x-signature con la libreria compartida (shared/hmac_utils.py).
+
+    La firma real es verify_hmac(secret, body, timestamp, signature): se llama SIEMPRE con
+    argumentos por nombre para no depender del orden posicional.
+    """
     if hmac_utils is None:
         logger.error("shared.hmac_utils no esta disponible en el paquete de la Lambda")
-        raise ApiError("INTERNAL_ERROR", "Verificacion de firma no disponible")
+        return False
     fn = (
-        getattr(hmac_utils, "verify_signature", None)
-        or getattr(hmac_utils, "verify_hmac", None)
+        getattr(hmac_utils, "verify_hmac", None)
+        or getattr(hmac_utils, "verify_signature", None)
         or getattr(hmac_utils, "verify", None)
     )
     if fn is None:
-        logger.error("hmac_utils no expone verify_signature/verify_hmac/verify")
-        raise ApiError("INTERNAL_ERROR", "Verificacion de firma no disponible")
-    return bool(fn(secret, timestamp, body, signature))
+        logger.error("hmac_utils no expone verify_hmac/verify_signature/verify")
+        return False
+    return bool(fn(secret, body=body, timestamp=timestamp, signature=signature))
 
 
 def parse_timestamp(value):

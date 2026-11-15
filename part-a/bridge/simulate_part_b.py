@@ -126,7 +126,8 @@ def main():
     except Exception as exc:
         print(f"ERROR: no se pudo resolver la URL de la API ({type(exc).__name__}). Usa --api-url.", file=sys.stderr)
         return 2
-    url = base + ALERTS_PATH
+    # /api/base-url de SSM ya termina en /v1; con --api-url a mano puede venir sin el.
+    url = base + ("/alerts" if base.endswith("/v1") else ALERTS_PATH)
 
     print(f"POST {url}")
     print(f"  {TIMESTAMP_HEADER}: {timestamp}")

@@ -117,6 +117,9 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      # El puente a Pub/Sub lee este stream (solo lecturas ya validadas e idempotentes).
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
       Tags:
         - { Key: proyecto, Value: arquifusion }
         - { Key: env, Value: !Ref Env }
@@ -208,10 +211,15 @@ Resources:
         - { AttributeName: machine_id, AttributeType: S }
         - { AttributeName: opened_at, AttributeType: S }
         - { AttributeName: status, AttributeType: S }
+        - { AttributeName: incident_id, AttributeType: S }
       KeySchema:
         - { AttributeName: machine_id, KeyType: HASH }
         - { AttributeName: opened_at, KeyType: RANGE }
       GlobalSecondaryIndexes:
+        - IndexName: incident_id-index
+          KeySchema:
+            - { AttributeName: incident_id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
         - IndexName: status-opened_at-index
           KeySchema:
             - { AttributeName: status, KeyType: HASH }
@@ -234,10 +242,15 @@ Resources:
         - { AttributeName: machine_id, AttributeType: S }
         - { AttributeName: opened_at, AttributeType: S }
         - { AttributeName: status, AttributeType: S }
+        - { AttributeName: incident_id, AttributeType: S }
       KeySchema:
         - { AttributeName: machine_id, KeyType: HASH }
         - { AttributeName: opened_at, KeyType: RANGE }
       GlobalSecondaryIndexes:
+        - IndexName: incident_id-index
+          KeySchema:
+            - { AttributeName: incident_id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
         - IndexName: status-opened_at-index
           KeySchema:
             - { AttributeName: status, KeyType: HASH }
@@ -380,6 +393,16 @@ Resources:
       Type: String
       Value: !Ref MachinesTable
       Description: Nombre de la tabla Machines.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  BridgeStreamArnParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/bridge/source-stream-arn
+      Type: String
+      Value: !GetAtt TelemetryTable.StreamArn
+      Description: ARN del stream de Telemetry (fuente del puente a Pub/Sub).
       Tags: { proyecto: arquifusion, env: !Ref Env }
 
   TelemetryTableParameter:

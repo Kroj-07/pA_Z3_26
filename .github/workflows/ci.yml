@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dependencias de prueba
+        run: pip install pyyaml boto3 pyarrow aws-sam-cli
+      - name: sam validate --lint (todas las plantillas)
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: dummy
+          AWS_SECRET_ACCESS_KEY: dummy
+        run: |
+          for t in infra/root/template.yaml infra/security/template.yaml infra/data/template.yaml \
+                   infra/ingest/template.yaml infra/api/template.yaml infra/api/events-template.yaml \
+                   infra/bridge/template.yaml part-a/sf2/template.yaml part-a/observability/template.yaml; do
+            echo "== $t"; sam validate --lint -t "$t"
+          done
+      - name: Pruebas y reglas del Learner Lab
+        run: scripts/run_tests.sh
+  secretos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Buscar claves en el repositorio
+        run: |
+          if grep -rIlE "AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC )?PRIVATE KEY-----|\"private_key\": \"-----" --exclude-dir=.git .; then
+            echo "Posible secreto en el repositorio" >&2; exit 1
+          fi
