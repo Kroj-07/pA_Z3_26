@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ArquiFusion Fleet Intelligence - Parte A - SF-2 Pipeline analitico (IA-5).
+  DynamoDB -> BigQuery (mock) -> reentrena por zona (Map) -> evalua -> Choice de promocion.
+  Solo serverless, LabRole, prefijo af-.
+
+Parameters:
+  Env:
+    Type: String
+    Default: test
+    AllowedValues: [shared, test]
+  LabRoleArn:
+    Type: String
+    Description: ARN de LabRole (Learner Lab no permite crear roles IAM). arn:aws:iam::<ACCOUNT_ID>:role/LabRole
+  Mock:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: true = BigQuery y entrenamiento simulados.
+  Zones:
+    Type: String
+    Default: ZONA-NORTE-01,ZONA-NORTE-02,ZONA-SUR-01
+  PromoteMinImprovement:
+    Type: String
+    Default: '0.02'
+    Description: Mejora relativa minima del MAE para promover el candidato.
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+  ScheduleEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  ScheduleOn: !Equals [!Ref ScheduleEnabled, 'true']
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 128
+    Role: !Ref LabRoleArn
+    Tracing: Active
+    CodeUri: functions/
+    Environment:
+      Variables:
+        ENV_NAME: !Ref Env
+        MOCK: !Ref Mock
+        ZONES: !Ref Zones
+        PROMOTE_MIN_IMPROVEMENT: !Ref PromoteMinImprovement
+        LOG_LEVEL: INFO
+
+Resources:
+  ListZonesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub af-${Env}-sf2-list-zones
+      Handler: pipeline.list_zones
+
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub af-${Env}-sf2-sync-bq
+      Handler: pipeline.sync_bigquery
+
+  TrainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub af-${Env}-sf2-train-zone
+      Handler: pipeline.train_zone
+
+  EvaluateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub af-${Env}-sf2-evaluate
+      Handler: pipeline.evaluate_model
+
+  PromoteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub af-${Env}-sf2-promote
+      Handler: pipeline.promote_model
+
+  BackupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub af-${Env}-sf2-backup-azure
+      Handler: pipeline.backup_to_azure
+
+  SummarizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub af-${Env}-sf2-summarize
+      Handler: pipeline.summarize
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/af-${Env}-sf2-pipeline
+      RetentionInDays: 7
+
+  Sf2StateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub af-${Env}-sf2-pipeline
+      Type: STANDARD
+      Role: !Ref LabRoleArn
+      DefinitionUri: statemachine.asl.json
+      DefinitionSubstitutions:
+        SyncFunctionArn: !GetAtt SyncFunction.Arn
+        ListZonesFunctionArn: !GetAtt ListZonesFunction.Arn
+        TrainFunctionArn: !GetAtt TrainFunction.Arn
+        EvaluateFunctionArn: !GetAtt EvaluateFunction.Arn
+        PromoteFunctionArn: !GetAtt PromoteFunction.Arn
+        BackupFunctionArn: !GetAtt BackupFunction.Arn
+        SummarizeFunctionArn: !GetAtt SummarizeFunction.Arn
+      Tracing:
+        Enabled: true
+      Logging:
+        Level: ALL
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+
+  # Regla directa (no el Events de SAM) para usar LabRole en vez de crear un rol nuevo.
+  Sf2ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub af-${Env}-sf2-schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      State: !If [ScheduleOn, ENABLED, DISABLED]
+      Targets:
+        - Id: af-sf2-target
+          Arn: !Ref Sf2StateMachine
+          RoleArn: !Ref LabRoleArn
+          Input: '{"force_failure": false, "zones": []}'
+
+  # Nombres publicados en SSM para otras IAs (observabilidad los lee).
+  Sf2ArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/sf2/state-machine-arn
+      Type: String
+      Value: !Ref Sf2StateMachine
+
+  Sf2NameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/sf2/state-machine-name
+      Type: String
+      Value: !GetAtt Sf2StateMachine.Name
+
+Outputs:
+  Sf2StateMachineArn:
+    Value: !Ref Sf2StateMachine
+  Sf2StateMachineName:
+    Value: !GetAtt Sf2StateMachine.Name
