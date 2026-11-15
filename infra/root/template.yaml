@@ -109,7 +109,6 @@ Resources:
   # --- Stacks anidados (orden: seguridad y datos primero; observabilidad al final) ------
   SecurityStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: [EnvParameter]
     Properties:
       TemplateURL: ../security/template.yaml
       Parameters:
@@ -135,7 +134,6 @@ Resources:
 
   IngestStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: [DataStack, SecurityStack]
     Properties:
       TemplateURL: ../ingest/template.yaml
       Parameters:
@@ -148,7 +146,6 @@ Resources:
 
   EventsStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: [DataStack]
     Properties:
       TemplateURL: ../api/events-template.yaml
       Parameters:
@@ -162,7 +159,6 @@ Resources:
 
   ApiStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: [DataStack, SecurityStack, EventsStack]
     Properties:
       TemplateURL: ../api/template.yaml
       Parameters:
@@ -175,7 +171,6 @@ Resources:
 
   BridgeStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: [DataStack, SecurityStack]
     Properties:
       TemplateURL: ../bridge/template.yaml
       Parameters:
@@ -187,7 +182,6 @@ Resources:
 
   Sf2Stack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: [DataStack, BridgeStack]
     Properties:
       TemplateURL: ../../part-a/sf2/template.yaml
       Parameters:
@@ -199,7 +193,6 @@ Resources:
 
   ObservabilityStack:
     Type: AWS::CloudFormation::Stack
-    DependsOn: [IngestStack, Sf2Stack]
     Properties:
       TemplateURL: ../../part-a/observability/template.yaml
       Parameters:
