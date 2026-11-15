@@ -1,0 +1,479 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ArquiFusion Fleet Intelligence - Parte A - persistencia (IA-2).
+  Seis tablas DynamoDB on-demand (contrato secc. 8), bucket S3 de telemetría en
+  Parquet con versionado y replicación entre regiones, y los nombres publicados
+  en SSM (/arquifusion/{env}/data/). Cuenta tratada como Learner Lab: LabRole,
+  solo us-east-1 y us-west-2, solo servicios de pago por uso.
+
+Metadata:
+  Proyecto: ArquiFusion Fleet Intelligence
+  Responsable: IA-2 (Ingesta y persistencia)
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - shared
+      - test
+    Default: test
+    Description: Entorno. "shared" es el compartido; "test" es el de pruebas.
+  StackRole:
+    Type: String
+    AllowedValues:
+      - primary
+      - replica
+    Default: primary
+    Description: >-
+      "primary" crea tablas y bucket principal. "replica" (desplegar en la OTRA
+      región) crea solo el bucket destino de la replicación.
+  EnableReplication:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: >-
+      Activa la replicación S3 hacia el bucket réplica. Despliega primero el
+      stack "replica" en la otra región.
+  EnableGlobalTables:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: >-
+      Convierte Alerts e Incidents en Global Tables (us-east-1 y us-west-2).
+      Decídelo antes del primer despliegue: cambiarlo después reemplaza las tablas.
+  LabRoleArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN de LabRole (lo pasa el stack raíz). Si va vacío se construye con la
+      cuenta actual.
+
+Rules:
+  SoloRegionesDelLab:
+    Assertions:
+      - Assert:
+          Fn::Contains:
+            - - us-east-1
+              - us-west-2
+            - !Ref AWS::Region
+        AssertDescription: Solo se permite us-east-1 y us-west-2 (Learner Lab).
+
+Conditions:
+  IsPrimary: !Equals [!Ref StackRole, primary]
+  IsReplicaRole: !Equals [!Ref StackRole, replica]
+  HasLabRoleArn: !Not [!Equals [!Ref LabRoleArn, ""]]
+  IsUsEast1: !Equals [!Ref AWS::Region, us-east-1]
+  GlobalOn: !And
+    - !Condition IsPrimary
+    - !Equals [!Ref EnableGlobalTables, "true"]
+  GlobalOff: !And
+    - !Condition IsPrimary
+    - !Equals [!Ref EnableGlobalTables, "false"]
+  ReplicationOn: !And
+    - !Condition IsPrimary
+    - !Equals [!Ref EnableReplication, "true"]
+
+Resources:
+  # ===========================================================================
+  # Tablas DynamoDB (todas on-demand, nombres af-{env}-*)
+  # ===========================================================================
+
+  # Estado actual de cada máquina (catálogo + última lectura). PK machine_id.
+  MachinesTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsPrimary
+    Properties:
+      TableName: !Sub af-${Env}-machines
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: machine_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: machine_id, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # Telemetría caliente. PK machine_id, SK timestamp. TTL de 30 días en "ttl".
+  # Sin PITR ni replicación: el histórico completo vive en S3 (Parquet) y se
+  # puede reproducir desde allí.
+  TelemetryTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsPrimary
+    Properties:
+      TableName: !Sub af-${Env}-telemetry
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: machine_id, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: machine_id, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # Alertas. PK machine_id, SK created_at. GSI por zona y por severidad.
+  # Variante normal (una región):
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: GlobalOff
+    Properties:
+      TableName: !Sub af-${Env}-alerts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: machine_id, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+        - { AttributeName: zone_id, AttributeType: S }
+        - { AttributeName: severity, AttributeType: S }
+      KeySchema:
+        - { AttributeName: machine_id, KeyType: HASH }
+        - { AttributeName: created_at, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: zone_id-created_at-index
+          KeySchema:
+            - { AttributeName: zone_id, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: severity-created_at-index
+          KeySchema:
+            - { AttributeName: severity, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # Variante Global Table (us-east-1 y us-west-2):
+  AlertsGlobalTable:
+    Type: AWS::DynamoDB::GlobalTable
+    Condition: GlobalOn
+    Properties:
+      TableName: !Sub af-${Env}-alerts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: machine_id, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+        - { AttributeName: zone_id, AttributeType: S }
+        - { AttributeName: severity, AttributeType: S }
+      KeySchema:
+        - { AttributeName: machine_id, KeyType: HASH }
+        - { AttributeName: created_at, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: zone_id-created_at-index
+          KeySchema:
+            - { AttributeName: zone_id, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: severity-created_at-index
+          KeySchema:
+            - { AttributeName: severity, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Replicas:
+        - Region: !Ref AWS::Region
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - { Key: proyecto, Value: arquifusion }
+            - { Key: env, Value: !Ref Env }
+        - Region: !If [IsUsEast1, us-west-2, us-east-1]
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - { Key: proyecto, Value: arquifusion }
+            - { Key: env, Value: !Ref Env }
+
+  # Incidentes. PK machine_id, SK opened_at. GSI por estado.
+  # Variante normal (una región):
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: GlobalOff
+    Properties:
+      TableName: !Sub af-${Env}-incidents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: machine_id, AttributeType: S }
+        - { AttributeName: opened_at, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+      KeySchema:
+        - { AttributeName: machine_id, KeyType: HASH }
+        - { AttributeName: opened_at, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: status-opened_at-index
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: opened_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # Variante Global Table (us-east-1 y us-west-2):
+  IncidentsGlobalTable:
+    Type: AWS::DynamoDB::GlobalTable
+    Condition: GlobalOn
+    Properties:
+      TableName: !Sub af-${Env}-incidents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: machine_id, AttributeType: S }
+        - { AttributeName: opened_at, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+      KeySchema:
+        - { AttributeName: machine_id, KeyType: HASH }
+        - { AttributeName: opened_at, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: status-opened_at-index
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: opened_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Replicas:
+        - Region: !Ref AWS::Region
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - { Key: proyecto, Value: arquifusion }
+            - { Key: env, Value: !Ref Env }
+        - Region: !If [IsUsEast1, us-west-2, us-east-1]
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - { Key: proyecto, Value: arquifusion }
+            - { Key: env, Value: !Ref Env }
+
+  # Técnicos. PK technician_id.
+  TechniciansTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsPrimary
+    Properties:
+      TableName: !Sub af-${Env}-technicians
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: technician_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: technician_id, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # Inventario de repuestos por zona. PK zone_id, SK part_id.
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsPrimary
+    Properties:
+      TableName: !Sub af-${Env}-inventory
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: zone_id, AttributeType: S }
+        - { AttributeName: part_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: zone_id, KeyType: HASH }
+        - { AttributeName: part_id, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # ===========================================================================
+  # Buckets S3
+  # ===========================================================================
+
+  # Bucket principal. Rutas del contrato: telemetry/year=YYYY/month=MM/day=DD/zone=ZONA-X/
+  # (Parquet), analytics/ (resultados de B) y exports/ (CSV para el jurado).
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsPrimary
+    Properties:
+      BucketName: !Sub af-${Env}-data-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: limpiar-versiones-antiguas
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      ReplicationConfiguration: !If
+        - ReplicationOn
+        - Role: !If
+            - HasLabRoleArn
+            - !Ref LabRoleArn
+            - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole
+          Rules:
+            - Id: replicar-todo
+              Status: Enabled
+              Priority: 1
+              Filter:
+                Prefix: ""
+              DeleteMarkerReplication:
+                Status: Disabled
+              Destination:
+                Bucket: !Sub arn:${AWS::Partition}:s3:::af-${Env}-data-replica-${AWS::AccountId}
+                StorageClass: STANDARD
+        - !Ref AWS::NoValue
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # Bucket destino de la replicación (se crea desplegando con StackRole=replica
+  # en la otra región). También versionado, como exige la replicación.
+  ReplicaBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsReplicaRole
+    Properties:
+      BucketName: !Sub af-${Env}-data-replica-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - { Key: proyecto, Value: arquifusion }
+        - { Key: env, Value: !Ref Env }
+
+  # ===========================================================================
+  # Nombres publicados en SSM: nadie escribe nombres de recursos a mano
+  # ===========================================================================
+  MachinesTableParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/machines-table
+      Type: String
+      Value: !Ref MachinesTable
+      Description: Nombre de la tabla Machines.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  TelemetryTableParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/telemetry-table
+      Type: String
+      Value: !Ref TelemetryTable
+      Description: Nombre de la tabla Telemetry.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  AlertsTableParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/alerts-table
+      Type: String
+      Value: !If [GlobalOn, !Ref AlertsGlobalTable, !Ref AlertsTable]
+      Description: Nombre de la tabla Alerts.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  IncidentsTableParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/incidents-table
+      Type: String
+      Value: !If [GlobalOn, !Ref IncidentsGlobalTable, !Ref IncidentsTable]
+      Description: Nombre de la tabla Incidents.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  TechniciansTableParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/technicians-table
+      Type: String
+      Value: !Ref TechniciansTable
+      Description: Nombre de la tabla Technicians.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  InventoryTableParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/inventory-table
+      Type: String
+      Value: !Ref InventoryTable
+      Description: Nombre de la tabla Inventory.
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  DataBucketParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/telemetry-bucket
+      Type: String
+      Value: !Ref DataBucket
+      Description: Bucket S3 principal (telemetry/, analytics/, exports/).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+  ReplicaBucketParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsReplicaRole
+    Properties:
+      Name: !Sub /arquifusion/${Env}/data/replica-bucket
+      Type: String
+      Value: !Ref ReplicaBucket
+      Description: Bucket S3 réplica (región opuesta a la del bucket principal).
+      Tags: { proyecto: arquifusion, env: !Ref Env }
+
+Outputs:
+  MachinesTableName:
+    Condition: IsPrimary
+    Value: !Ref MachinesTable
+  TelemetryTableName:
+    Condition: IsPrimary
+    Value: !Ref TelemetryTable
+  AlertsTableName:
+    Condition: IsPrimary
+    Value: !If [GlobalOn, !Ref AlertsGlobalTable, !Ref AlertsTable]
+  IncidentsTableName:
+    Condition: IsPrimary
+    Value: !If [GlobalOn, !Ref IncidentsGlobalTable, !Ref IncidentsTable]
+  TechniciansTableName:
+    Condition: IsPrimary
+    Value: !Ref TechniciansTable
+  InventoryTableName:
+    Condition: IsPrimary
+    Value: !Ref InventoryTable
+  DataBucketName:
+    Condition: IsPrimary
+    Value: !Ref DataBucket
+  ReplicaBucketName:
+    Condition: IsReplicaRole
+    Value: !Ref ReplicaBucket

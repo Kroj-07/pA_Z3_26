@@ -1,0 +1,10 @@
+# Lambda de ingesta (runtime python3.12).
+#
+# boto3 ya viene en el runtime de Lambda: no hace falta empaquetarlo, pero se lista
+# para correr las pruebas en local. Se pide una versión reciente porque el
+# If-None-Match de put_object (escritura condicional de S3) es de 2024.
+boto3>=1.35.90
+
+# Necesario para escribir Parquet en S3. Pesa mucho: en Lambda conviene usar la
+# capa pública "AWSSDKPandas-Python312" (incluye pyarrow) en vez de empaquetarlo.
+pyarrow>=15.0.0
