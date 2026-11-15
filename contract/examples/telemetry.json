@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "machine_id": "MCH-000123",
+  "timestamp": "2026-11-14T15:04:05Z",
+  "location": {
+    "lat": -12.0464,
+    "lon": -77.0428,
+    "zone_id": "ZONA-NORTE-02"
+  },
+  "status": "operating",
+  "metrics": {
+    "engine_temp_c": 92.4,
+    "vibration_mm_s": 4.8,
+    "pressure_bar": 6.1,
+    "fuel_rate_lph": 31.2,
+    "load_kg": 12400,
+    "speed_kmh": 18.5,
+    "engine_rpm": 1850,
+    "operating_hours_total": 3240.7
+  }
+}
