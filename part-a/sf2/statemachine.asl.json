@@ -1,0 +1,162 @@
+{
+  "Comment": "ArquiFusion SF-2: sincroniza DynamoDB->BigQuery, reentrena por zona y decide si promueve el modelo",
+  "StartAt": "ApplyDefaults",
+  "States": {
+    "ApplyDefaults": {
+      "Type": "Pass",
+      "Comment": "Rellena force_failure y zones si el disparador no los trae",
+      "Parameters": {
+        "input.$": "States.JsonMerge(States.StringToJson('{\"force_failure\":false,\"zones\":[]}'), $$.Execution.Input, false)"
+      },
+      "OutputPath": "$.input",
+      "Next": "SyncToBigQuery"
+    },
+    "SyncToBigQuery": {
+      "Type": "Task",
+      "Resource": "${SyncFunctionArn}",
+      "Parameters": {
+        "run_id.$": "$$.Execution.Name",
+        "force_failure.$": "$.force_failure"
+      },
+      "ResultPath": "$.sync",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
+      ],
+      "Next": "ListZones"
+    },
+    "ListZones": {
+      "Type": "Task",
+      "Resource": "${ListZonesFunctionArn}",
+      "Parameters": { "zones.$": "$.zones" },
+      "ResultPath": "$.zone_list",
+      "Retry": [
+        { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
+      ],
+      "Next": "ProcessZones"
+    },
+    "ProcessZones": {
+      "Type": "Map",
+      "ItemsPath": "$.zone_list.zones",
+      "MaxConcurrency": 3,
+      "ItemSelector": {
+        "zone_id.$": "$$.Map.Item.Value",
+        "run_id.$": "$$.Execution.Name"
+      },
+      "ResultPath": "$.results",
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "TrainZoneModel",
+        "States": {
+          "TrainZoneModel": {
+            "Type": "Task",
+            "Resource": "${TrainFunctionArn}",
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 5, "MaxAttempts": 2, "BackoffRate": 2.0 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ZoneFailed" }
+            ],
+            "Next": "EvaluateModel"
+          },
+          "EvaluateModel": {
+            "Type": "Task",
+            "Resource": "${EvaluateFunctionArn}",
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ZoneFailed" }
+            ],
+            "Next": "PromoteOrKeep"
+          },
+          "PromoteOrKeep": {
+            "Type": "Choice",
+            "Choices": [
+              { "Variable": "$.evaluation.promote", "BooleanEquals": true, "Next": "PromoteModel" }
+            ],
+            "Default": "KeepCurrentModel"
+          },
+          "PromoteModel": {
+            "Type": "Task",
+            "Resource": "${PromoteFunctionArn}",
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ZoneFailed" }
+            ],
+            "End": true
+          },
+          "KeepCurrentModel": {
+            "Type": "Pass",
+            "Parameters": {
+              "zone_id.$": "$.zone_id",
+              "promoted": false,
+              "status": "OK",
+              "reason": "improvement_below_threshold",
+              "improvement.$": "$.evaluation.improvement"
+            },
+            "End": true
+          },
+          "ZoneFailed": {
+            "Type": "Pass",
+            "Comment": "Un fallo en una zona no tumba al resto: se registra y la Map continúa",
+            "Parameters": {
+              "zone_id.$": "$.zone_id",
+              "promoted": false,
+              "status": "FAILED",
+              "error.$": "$.error"
+            },
+            "End": true
+          }
+        }
+      },
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
+      ],
+      "Next": "BackupToAzure"
+    },
+    "BackupToAzure": {
+      "Type": "Task",
+      "Comment": "Contrato 11, respaldo a Azure (A10). Un fallo aqui NO tumba el pipeline: se registra y se sigue",
+      "Resource": "${BackupFunctionArn}",
+      "Parameters": { "run_id.$": "$$.Execution.Name" },
+      "ResultPath": "$.backup",
+      "Retry": [
+        { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.backup_error", "Next": "Summarize" }
+      ],
+      "Next": "Summarize"
+    },
+    "Summarize": {
+      "Type": "Task",
+      "Resource": "${SummarizeFunctionArn}",
+      "Parameters": {
+        "run_id.$": "$$.Execution.Name",
+        "rows_synced.$": "$.sync.rows_synced",
+        "results.$": "$.results"
+      },
+      "ResultPath": "$.summary",
+      "Retry": [
+        { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
+      ],
+      "Next": "PipelineSucceeded"
+    },
+    "PipelineSucceeded": { "Type": "Succeed" },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "Sf2PipelineError",
+      "Cause": "Fallo en el pipeline analitico SF-2 (ver $.error en la ejecucion)"
+    }
+  }
+}

@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ArquiFusion Fleet Intelligence - Parte A - Observabilidad (IA-5).
+  Alarmas CloudWatch (errores de ingesta, latencia p95, cola SQS, DLQ, SF-2), dashboard,
+  topico SNS y configuracion de X-Ray. Los nombres de recursos de otras IAs se leen de SSM.
+
+Parameters:
+  Env:
+    Type: String
+    Default: test
+    AllowedValues: [shared, test]
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Correo que recibe las alarmas (vacio = sin suscripcion).
+  IngestLatencyP95Ms:
+    Type: Number
+    Default: 1000
+  QueueAgeSeconds:
+    Type: Number
+    Default: 120
+    Description: Edad maxima aceptable del mensaje mas viejo en la cola (detecta consumidor caido).
+  XRayFixedRate:
+    Type: Number
+    Default: 0.01
+    Description: Fraccion de peticiones trazadas. 0.01 = 1% (ver costs.md, X-Ray es de los costos mas sensibles).
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+# Nombres leidos de SSM (supuesto: confirmar con IA-2 / contrato):
+#   /arquifusion/{env}/ingest/function-name   Lambda de ingesta
+#   /arquifusion/{env}/ingest/queue-name      cola SQS principal
+#   /arquifusion/{env}/ingest/dlq-name        cola de mensajes muertos
+#   /arquifusion/{env}/sf2/state-machine-arn  publicado por part-a/sf2/template.yaml
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub af-${Env}-alarms
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ---------- Ingesta ----------
+  IngestErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub af-${Env}-ingest-errors
+      AlarmDescription: La Lambda de ingesta devuelve errores (2 de 3 minutos).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '{{resolve:ssm:/arquifusion/${Env}/ingest/function-name}}'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  IngestLatencyP95Alarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub af-${Env}-ingest-latency-p95
+      AlarmDescription: Latencia p95 de la Lambda de ingesta por encima del umbral (3 de 5 minutos).
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '{{resolve:ssm:/arquifusion/${Env}/ingest/function-name}}'
+      ExtendedStatistic: p95
+      Unit: Milliseconds
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: !Ref IngestLatencyP95Ms
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  IngestThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub af-${Env}-ingest-throttles
+      AlarmDescription: La Lambda de ingesta esta siendo limitada (concurrencia agotada).
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '{{resolve:ssm:/arquifusion/${Env}/ingest/function-name}}'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ---------- Cola SQS (detecta consumidor caido: lo prueba chaos_sqs.py) ----------
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub af-${Env}-queue-age
+      AlarmDescription: El mensaje mas viejo lleva demasiado en la cola; el consumidor no esta procesando.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '{{resolve:ssm:/arquifusion/${Env}/ingest/queue-name}}'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref QueueAgeSeconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  DlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub af-${Env}-dlq-depth
+      AlarmDescription: Hay mensajes en la DLQ de ingesta.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '{{resolve:ssm:/arquifusion/${Env}/ingest/dlq-name}}'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ---------- SF-2 ----------
+  Sf2ExecutionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub af-${Env}-sf2-executions-failed
+      AlarmDescription: Fallo una ejecucion del pipeline analitico SF-2.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Sub '{{resolve:ssm:/arquifusion/${Env}/sf2/state-machine-arn}}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Sf2ZonesFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub af-${Env}-sf2-zones-failed
+      AlarmDescription: Una o mas zonas fallaron dentro del Map del SF-2 (metrica EMF ZonesFailed).
+      Namespace: ArquiFusion/SF2
+      MetricName: ZonesFailed
+      Dimensions:
+        - Name: Env
+          Value: !Ref Env
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ---------- Dashboard ----------
+  FleetDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub af-${Env}-fleet
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{
+            "title":"Ingesta: errores y throttles","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,
+            "metrics":[["AWS/Lambda","Errors","FunctionName","{{resolve:ssm:/arquifusion/${Env}/ingest/function-name}}"],
+                       ["AWS/Lambda","Throttles","FunctionName","{{resolve:ssm:/arquifusion/${Env}/ingest/function-name}}"]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{
+            "title":"Ingesta: latencia p95 (ms)","region":"${AWS::Region}","view":"timeSeries","stat":"p95","period":60,
+            "metrics":[["AWS/Lambda","Duration","FunctionName","{{resolve:ssm:/arquifusion/${Env}/ingest/function-name}}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{
+            "title":"Cola: edad del mensaje mas viejo (s)","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,
+            "metrics":[["AWS/SQS","ApproximateAgeOfOldestMessage","QueueName","{{resolve:ssm:/arquifusion/${Env}/ingest/queue-name}}"]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{
+            "title":"Cola y DLQ: mensajes visibles","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,
+            "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","{{resolve:ssm:/arquifusion/${Env}/ingest/queue-name}}"],
+                       ["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","{{resolve:ssm:/arquifusion/${Env}/ingest/dlq-name}}"]]}},
+          {"type":"metric","x":0,"y":12,"width":24,"height":6,"properties":{
+            "title":"SF-2: zonas procesadas / promovidas / fallidas","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":300,
+            "metrics":[["ArquiFusion/SF2","ZonesProcessed","Env","${Env}"],
+                       ["ArquiFusion/SF2","ZonesPromoted","Env","${Env}"],
+                       ["ArquiFusion/SF2","ZonesFailed","Env","${Env}"]]}}
+        ]}
+
+  # ---------- X-Ray ----------
+  XRaySamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Properties:
+      SamplingRule:
+        RuleName: !Sub af-${Env}-sampling
+        Priority: 1000
+        FixedRate: !Ref XRayFixedRate
+        ReservoirSize: 1
+        ServiceName: '*'
+        ServiceType: '*'
+        Host: '*'
+        HTTPMethod: '*'
+        URLPath: '*'
+        ResourceARN: '*'
+        Version: 1
+
+  XRayErrorsGroup:
+    Type: AWS::XRay::Group
+    Properties:
+      GroupName: !Sub af-${Env}-slow-or-failed
+      FilterExpression: 'responsetime > 1 OR fault = true OR error = true'
+      InsightsConfiguration:
+        InsightsEnabled: false
+        NotificationsEnabled: false
+
+  AlarmTopicArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/observability/alarm-topic-arn
+      Type: String
+      Value: !Ref AlarmTopic
+
+Outputs:
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  DashboardName:
+    Value: !Sub af-${Env}-fleet
