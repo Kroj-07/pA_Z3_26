@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ArquiFusion - Parte A - API REST /v1 (API Gateway + Lambdas + autorizador).
+  Endpoints: GET /machines, GET /alerts, GET /technicians, GET /incidents, POST /alerts (HMAC).
+  Todo corre con LabRole (Learner Lab), solo us-east-1 y us-west-2, sin servidores permanentes.
+
+# -----------------------------------------------------------------------------
+# Despliegue (orden: root -> persistencia -> events-template -> este stack)
+#   sam build  -t infra/api/template.yaml
+#   sam deploy -t infra/api/template.yaml --stack-name af-dev-api \
+#       --parameter-overrides Env=dev --region us-east-1 --resolve-s3
+# Los nombres de tablas y del bus se leen de SSM (/arquifusion/{env}/...) al desplegar;
+# si cambia un valor en SSM hay que volver a desplegar este stack.
+# -----------------------------------------------------------------------------
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9]{2,8}$'
+    Description: Entorno (dev, test...). Se usa en nombres af-{env}-* y en /arquifusion/{env}/.
+  LabRoleName:
+    Type: String
+    Default: LabRole
+    Description: Nombre del rol del Learner Lab que usan todas las Lambdas.
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: Origen permitido por CORS (la URL de la app web en Azure Static Web Apps cuando exista).
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: Retencion de logs de las Lambdas, para controlar costo.
+
+Rules:
+  SoloRegionesDelLab:
+    Assertions:
+      - Assert: !Contains [[us-east-1, us-west-2], !Ref 'AWS::Region']
+        AssertDescription: Solo se permite desplegar en us-east-1 o us-west-2.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    # Todas las Lambdas usan LabRole: SAM no crea ningun rol IAM.
+    Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+    # Raiz de codigo = /part-a. Los handlers importan como api.*, shared.* (paquetes de namespace).
+    CodeUri: ../../part-a/
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    Tags:
+      Project: arquifusion
+      Env: !Ref Env
+      Part: A
+    Environment:
+      Variables:
+        ENV: !Ref Env
+        LOG_LEVEL: INFO
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # API Gateway REST /v1
+  # ---------------------------------------------------------------------------
+  AfApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'af-${Env}-api'
+      StageName: v1
+      OpenApiVersion: '3.0.1'
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      MinimumCompressionSize: 1024
+      Cors:
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,x-timestamp,x-signature'"
+        MaxAge: "'600'"
+      Auth:
+        DefaultAuthorizer: AfLambdaAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          AfLambdaAuthorizer:
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            FunctionPayloadType: REQUEST
+            Identity:
+              Headers:
+                - Authorization
+              ReauthorizeEvery: 300
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+      # Errores de API Gateway en el formato uniforme de la seccion 6.8 del contrato.
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"UNAUTHORIZED","message":"Credenciales ausentes o invalidas","details":{},"request_id":"$context.requestId"}}'
+        ACCESS_DENIED:
+          StatusCode: 403
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"FORBIDDEN","message":"El rol no tiene permiso para este recurso","details":{},"request_id":"$context.requestId"}}'
+        THROTTLED:
+          StatusCode: 429
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"RATE_LIMITED","message":"Demasiadas solicitudes","details":{},"request_id":"$context.requestId"}}'
+        MISSING_AUTHENTICATION_TOKEN:
+          StatusCode: 404
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"NOT_FOUND","message":"Ruta no encontrada","details":{},"request_id":"$context.requestId"}}'
+        BAD_REQUEST_PARAMETERS:
+          StatusCode: 400
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"VALIDATION_ERROR","message":"Parametros de solicitud invalidos","details":{},"request_id":"$context.requestId"}}'
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"INTERNAL_ERROR","message":"Error interno","details":{},"request_id":"$context.requestId"}}'
+
+  # ---------------------------------------------------------------------------
+  # Lambda de lectura: enruta GET /machines, /alerts, /technicians, /incidents
+  # ---------------------------------------------------------------------------
+  ApiReadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'af-${Env}-api-read'
+      Description: Endpoints de lectura de la API (enrutamiento, paginacion con next_token, errores 6.8).
+      Handler: api.app.handler
+      Environment:
+        Variables:
+          TABLE_MACHINES: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/machines-table}}'
+          TABLE_ALERTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/alerts-table}}'
+          TABLE_TECHNICIANS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/technicians-table}}'
+          TABLE_INCIDENTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/incidents-table}}'
+          DEFAULT_PAGE_SIZE: '50'
+          MAX_PAGE_SIZE: '200'
+      Events:
+        GetMachines:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /machines
+            Method: get
+        GetAlerts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /alerts
+            Method: get
+        GetTechnicians:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /technicians
+            Method: get
+        GetIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /incidents
+            Method: get
+
+  # ---------------------------------------------------------------------------
+  # Lambda POST /alerts: recibe la alerta de la Parte B (Cloud Run), verifica HMAC
+  # sobre "timestamp.cuerpo", guarda en DynamoDB y publica alert.created.
+  # Sin autorizador: la autenticacion es la firma HMAC.
+  # ---------------------------------------------------------------------------
+  ApiAlertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'af-${Env}-api-alerts'
+      Description: POST /alerts (verifica HMAC, guarda en DynamoDB, publica alert.created en EventBridge).
+      Handler: api.alerts.handler
+      Environment:
+        Variables:
+          TABLE_ALERTS: !Sub '{{resolve:ssm:/arquifusion/${Env}/ddb/alerts-table}}'
+          EVENT_BUS_NAME: !Sub '{{resolve:ssm:/arquifusion/${Env}/events/bus-name}}'
+          HMAC_SECRET_ID: !Sub 'arquifusion/${Env}/alert-hmac'
+          HMAC_MAX_SKEW_SECONDS: '300'
+      Events:
+        PostAlerts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AfApi
+            Path: /alerts
+            Method: post
+            Auth:
+              Authorizer: NONE
+
+  # ---------------------------------------------------------------------------
+  # Autorizador Lambda (REQUEST). Se elige sobre Cognito porque el Learner Lab
+  # puede bloquear Cognito. Valida un JWT HS256 con claim "role"; el secreto
+  # de firma vive en Secrets Manager. Codigo: /part-a/api/authorizer.py
+  # ---------------------------------------------------------------------------
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'af-${Env}-api-authorizer'
+      Description: Autorizador Lambda de la API (JWT con rol).
+      Handler: api.authorizer.handler
+      Timeout: 5
+      Environment:
+        Variables:
+          JWT_SECRET_ID: !Sub 'arquifusion/${Env}/jwt-signing'
+
+  # ---------------------------------------------------------------------------
+  # Logs con retencion fija (evita acumular costo)
+  # ---------------------------------------------------------------------------
+  ApiReadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/af-${Env}-api-read'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiAlertsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/af-${Env}-api-alerts'
+      RetentionInDays: !Ref LogRetentionDays
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/af-${Env}-api-authorizer'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # Valores publicados en SSM para que las demas partes encuentren la API
+  # ---------------------------------------------------------------------------
+  ApiBaseUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/api/base-url'
+      Type: String
+      Value: !Sub 'https://${AfApi}.execute-api.${AWS::Region}.amazonaws.com/v1'
+      Description: URL base de la API REST /v1 de ArquiFusion.
+
+Outputs:
+  ApiBaseUrl:
+    Description: URL base de la API (prefijo /v1 incluido)
+    Value: !Sub 'https://${AfApi}.execute-api.${AWS::Region}.amazonaws.com/v1'
+  ApiId:
+    Description: Id de la API REST
+    Value: !Ref AfApi
+  ApiReadFunctionArn:
+    Value: !GetAtt ApiReadFunction.Arn
+  ApiAlertsFunctionArn:
+    Value: !GetAtt ApiAlertsFunction.Arn
+  AuthorizerFunctionArn:
+    Value: !GetAtt AuthorizerFunction.Arn

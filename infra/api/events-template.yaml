@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ArquiFusion - Parte A - Bus de eventos (EventBridge), reglas alert.created / incident.opened /
+  incident.closed, topicos SNS por rol, tabla de notificaciones y Lambda notificadora.
+  Todo con LabRole, solo us-east-1 / us-west-2 y sin servidores permanentes.
+
+# -----------------------------------------------------------------------------
+# Despliegue (antes que infra/api/template.yaml, que lee de SSM la tabla de notificaciones):
+#   sam build  -t infra/api/events-template.yaml
+#   sam deploy -t infra/api/events-template.yaml --stack-name af-dev-events \
+#       --parameter-overrides Env=dev --region us-east-1 --resolve-s3
+# Publica en SSM (/arquifusion/{env}/...): events/bus-name, events/bus-arn, events/dlq-arn,
+# ddb/notifications-table y sns/{rol}-topic-arn.
+# -----------------------------------------------------------------------------
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9]{2,8}$'
+  LabRoleName:
+    Type: String
+    Default: LabRole
+  SesSenderEmail:
+    Type: String
+    Default: ''
+    Description: Remitente verificado en SES (vacio = no se envian correos, solo SNS y bandeja de la app).
+  IncidentWorkflowArn:
+    Type: String
+    Default: ''
+    Description: ARN de SF-1 (Ciclo del incidente). Si se indica, alert.created tambien lo dispara (rol LabRole debe confiar en events).
+  MassiveMinMachines:
+    Type: Number
+    Default: 3
+    Description: Cantidad de maquinas relacionadas desde la cual una alerta critica se considera masiva.
+  NotificationTtlDays:
+    Type: Number
+    Default: 30
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  SchedulesState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Estado de las reglas programadas que envian los resumenes.
+  EnableEventArchive:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Archiva los eventos del bus 7 dias para poder reproducirlos (verificar que el Lab lo permita).
+
+Conditions:
+  HasIncidentWorkflow: !Not [!Equals [!Ref IncidentWorkflowArn, '']]
+  ArchiveEnabled: !Equals [!Ref EnableEventArchive, 'true']
+
+Rules:
+  SoloRegionesDelLab:
+    Assertions:
+      - Assert: !Contains [[us-east-1, us-west-2], !Ref 'AWS::Region']
+        AssertDescription: Solo se permite desplegar en us-east-1 o us-west-2.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+    CodeUri: ../../part-a/
+    MemorySize: 256
+    Tracing: Active
+    Tags:
+      Project: arquifusion
+      Env: !Ref Env
+      Part: A
+    Environment:
+      Variables:
+        ENV: !Ref Env
+        LOG_LEVEL: INFO
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Bus de eventos (nombre acordado: af-{env}-arquifusion-events)
+  # ---------------------------------------------------------------------------
+  AfBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub 'af-${Env}-arquifusion-events'
+      Tags:
+        - { Key: Project, Value: arquifusion }
+        - { Key: Env, Value: !Ref Env }
+
+  AfBusArchive:
+    Type: AWS::Events::Archive
+    Condition: ArchiveEnabled
+    Properties:
+      ArchiveName: !Sub 'af-${Env}-events-archive'
+      SourceArn: !GetAtt AfBus.Arn
+      RetentionDays: 7
+      Description: Archivo para reproducir eventos del bus de ArquiFusion.
+
+  # Cola de mensajes fallidos: entregas que EventBridge no logro hacer y eventos que la Lambda
+  # no pudo procesar tras los reintentos.
+  EventsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'af-${Env}-events-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  EventsDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventsDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeRules
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventsDlq.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${AfBus}/*'
+
+  # ---------------------------------------------------------------------------
+  # Tabla de notificaciones (bandeja de la app + cola de resumenes)
+  # PK recipient_role, SK "<created_at>#<tipo>#<id>". Indice disperso by_pending_digest.
+  # ---------------------------------------------------------------------------
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'af-${Env}-notifications'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: recipient_role, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: digest_period, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: recipient_role, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: by_pending_digest
+          KeySchema:
+            - { AttributeName: digest_period, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: arquifusion }
+        - { Key: Env, Value: !Ref Env }
+
+  # ---------------------------------------------------------------------------
+  # Topicos SNS por rol (las suscripciones - SMS, correo, filtros por zona - se agregan aparte;
+  # el notificador publica con atributos role, severity, zone_id, machine_id, technician_id)
+  # ---------------------------------------------------------------------------
+  TopicOperator:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'af-${Env}-notify-operator'
+  TopicTechnician:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'af-${Env}-notify-technician'
+  TopicMaintenance:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'af-${Env}-notify-maintenance'
+  TopicSupervisor:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'af-${Env}-notify-supervisor'
+  TopicAdmin:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'af-${Env}-notify-admin'
+  TopicManagement:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'af-${Env}-notify-management'
+
+  # ---------------------------------------------------------------------------
+  # Lambda notificadora
+  # ---------------------------------------------------------------------------
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'af-${Env}-notifier'
+      Description: Notificaciones por rol (tabla 6.9) a SNS/SES y resumenes programados.
+      Handler: events.notifier.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NOTIFICATIONS: !Ref NotificationsTable
+          DIGEST_INDEX: by_pending_digest
+          SSM_PREFIX: !Sub '/arquifusion/${Env}'
+          SES_SENDER: !Ref SesSenderEmail
+          MASSIVE_MIN_MACHINES: !Ref MassiveMinMachines
+          NOTIFICATION_TTL_DAYS: !Ref NotificationTtlDays
+          TOPIC_OPERATOR: !Ref TopicOperator
+          TOPIC_TECHNICIAN: !Ref TopicTechnician
+          TOPIC_MAINTENANCE: !Ref TopicMaintenance
+          TOPIC_SUPERVISOR: !Ref TopicSupervisor
+          TOPIC_ADMIN: !Ref TopicAdmin
+          TOPIC_MANAGEMENT: !Ref TopicManagement
+
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/af-${Env}-notifier'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Reintentos asincronos y destino de fallos (la Lambda es invocada de forma asincrona por EventBridge)
+  NotifierInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 3600
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt EventsDlq.Arn
+
+  # ---------------------------------------------------------------------------
+  # Reglas del bus (se filtra solo por detail-type; el origen puede ser la API o la Parte B)
+  # ---------------------------------------------------------------------------
+  AlertCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'af-${Env}-alert-created'
+      EventBusName: !Ref AfBus
+      State: ENABLED
+      EventPattern:
+        detail-type: [alert.created]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventsDlq.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAgeInSeconds: 3600
+        - !If
+          - HasIncidentWorkflow
+          - Id: incident-workflow
+            Arn: !Ref IncidentWorkflowArn
+            RoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+            DeadLetterConfig:
+              Arn: !GetAtt EventsDlq.Arn
+          - !Ref AWS::NoValue
+
+  IncidentOpenedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'af-${Env}-incident-opened'
+      EventBusName: !Ref AfBus
+      State: ENABLED
+      EventPattern:
+        detail-type: [incident.opened]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventsDlq.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAgeInSeconds: 3600
+
+  IncidentClosedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'af-${Env}-incident-closed'
+      EventBusName: !Ref AfBus
+      State: ENABLED
+      EventPattern:
+        detail-type: [incident.closed]
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventsDlq.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAgeInSeconds: 3600
+
+  AlertCreatedPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlertCreatedRule.Arn
+
+  IncidentOpenedPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IncidentOpenedRule.Arn
+
+  IncidentClosedPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IncidentClosedRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # Resumenes programados (bus por defecto; hora de Lima = UTC-5)
+  # ---------------------------------------------------------------------------
+  DigestHourlyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'af-${Env}-digest-hourly'
+      State: !Ref SchedulesState
+      ScheduleExpression: rate(1 hour)
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+          Input: '{"mode":"digest","period":"hourly"}'
+
+  DigestShiftRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'af-${Env}-digest-shift'
+      State: !Ref SchedulesState
+      ScheduleExpression: rate(8 hours)
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+          Input: '{"mode":"digest","period":"shift"}'
+
+  DigestDailyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'af-${Env}-digest-daily'
+      State: !Ref SchedulesState
+      ScheduleExpression: cron(0 11 * * ? *)   # 06:00 hora de Lima
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+          Input: '{"mode":"digest","period":"daily"}'
+
+  DigestWeeklyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'af-${Env}-digest-weekly'
+      State: !Ref SchedulesState
+      ScheduleExpression: cron(0 12 ? * MON *)   # lunes 07:00 hora de Lima
+      Targets:
+        - Id: notifier
+          Arn: !GetAtt NotifierFunction.Arn
+          Input: '{"mode":"digest","period":"weekly"}'
+
+  DigestHourlyPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DigestHourlyRule.Arn
+
+  DigestShiftPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DigestShiftRule.Arn
+
+  DigestDailyPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DigestDailyRule.Arn
+
+  DigestWeeklyPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DigestWeeklyRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # Nombres publicados en SSM para las demas partes
+  # ---------------------------------------------------------------------------
+  BusNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/events/bus-name'
+      Type: String
+      Value: !Ref AfBus
+      Description: Nombre del bus de eventos de ArquiFusion.
+  BusArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/events/bus-arn'
+      Type: String
+      Value: !GetAtt AfBus.Arn
+  DlqArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/events/dlq-arn'
+      Type: String
+      Value: !GetAtt EventsDlq.Arn
+  NotificationsTableParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/ddb/notifications-table'
+      Type: String
+      Value: !Ref NotificationsTable
+  OperatorTopicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/sns/operator-topic-arn'
+      Type: String
+      Value: !Ref TopicOperator
+  TechnicianTopicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/sns/technician-topic-arn'
+      Type: String
+      Value: !Ref TopicTechnician
+  MaintenanceTopicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/sns/maintenance-topic-arn'
+      Type: String
+      Value: !Ref TopicMaintenance
+  SupervisorTopicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/sns/supervisor-topic-arn'
+      Type: String
+      Value: !Ref TopicSupervisor
+  AdminTopicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/sns/admin-topic-arn'
+      Type: String
+      Value: !Ref TopicAdmin
+  ManagementTopicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/arquifusion/${Env}/sns/management-topic-arn'
+      Type: String
+      Value: !Ref TopicManagement
+
+Outputs:
+  BusName:
+    Value: !Ref AfBus
+  BusArn:
+    Value: !GetAtt AfBus.Arn
+  NotificationsTableName:
+    Value: !Ref NotificationsTable
+  NotifierFunctionArn:
+    Value: !GetAtt NotifierFunction.Arn
+  DlqUrl:
+    Value: !Ref EventsDlq
