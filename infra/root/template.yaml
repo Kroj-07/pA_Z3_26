@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  ArquiFusion Fleet Intelligence - Parte A - stack raíz (esqueleto).
+  Publica la configuración común en SSM (/arquifusion/{env}/root/) y, cuando cada
+  IA entregue su plantilla, anida sus stacks. Cuenta tratada como Learner Lab:
+  todos los recursos usan LabRole, solo us-east-1 y us-west-2.
+
+Metadata:
+  Proyecto: ArquiFusion Fleet Intelligence
+  Responsable: IA-1 (Fundación)
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - shared
+      - test
+    Default: test
+    Description: Entorno. "shared" es el compartido; "test" es el de pruebas.
+  LabRoleName:
+    Type: String
+    Default: LabRole
+    Description: Nombre del rol único del Learner Lab. Todos los recursos lo usan.
+
+Rules:
+  SoloRegionesDelLab:
+    Assertions:
+      - Assert:
+          Fn::Contains:
+            - - us-east-1
+              - us-west-2
+            - !Ref AWS::Region
+        AssertDescription: Solo se permite us-east-1 y us-west-2 (Learner Lab).
+
+Resources:
+  # --- Configuración común, leída por las demás IAs desde SSM -----------------
+  EnvParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/root/env
+      Type: String
+      Value: !Ref Env
+      Description: Nombre del entorno (shared o test).
+      Tags:
+        proyecto: arquifusion
+        env: !Ref Env
+
+  LabRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/root/lab-role-arn
+      Type: String
+      Value: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}
+      Description: ARN de LabRole. Toda Lambda, máquina de estados y API lo usa como rol.
+      Tags:
+        proyecto: arquifusion
+        env: !Ref Env
+
+  RegionParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /arquifusion/${Env}/root/region
+      Type: String
+      Value: !Ref AWS::Region
+      Description: Región donde se desplegó este stack raíz.
+      Tags:
+        proyecto: arquifusion
+        env: !Ref Env
+
+  # --- Stacks anidados (descomentar cuando cada IA entregue su plantilla) -----
+  # Las rutas son una propuesta y cada IA debe confirmar la suya. Con
+  # `sam deploy` o `aws cloudformation package` las rutas locales se suben a S3.
+  # Pasar siempre Env y LabRoleArn: nada de nombres de recursos escritos a mano;
+  # los nombres se publican en SSM /arquifusion/{env}/ con prefijo af-.
+  #
+  # IngestStack:
+  #   Type: AWS::CloudFormation::Stack
+  #   DependsOn: LabRoleArnParameter
+  #   Properties:
+  #     TemplateURL: ../../part-a/ingest/template.yaml
+  #     Parameters:
+  #       Env: !Ref Env
+  #       LabRoleArn: !GetAtt LabRoleArnParameter.Value
+  #     Tags:
+  #       - { Key: proyecto, Value: arquifusion }
+  #       - { Key: env, Value: !Ref Env }
+  #
+  # DataStack:        # tablas DynamoDB, S3, replicación (infra/data)
+  # ApiStack:         # API REST /v1 (part-a/api)
+  # BridgeStack:      # puente a Pub/Sub (part-a/bridge, infra/bridge)
+  # Sf2Stack:         # pipeline analítico diario (part-a/sf2)
+  # BackupStack:      # respaldo a Azure Blob, A10 (part-a/backup)
+  # EventsStack:      # EventBridge y notificaciones (part-a/events)
+  # ObservabilityStack: # CloudWatch y X-Ray (part-a/observability)
+
+Outputs:
+  Env:
+    Description: Entorno desplegado.
+    Value: !Ref Env
+  LabRoleArn:
+    Description: ARN de LabRole usado por todos los recursos.
+    Value: !GetAtt LabRoleArnParameter.Value
+  SsmPrefix:
+    Description: Prefijo SSM de este entorno.
+    Value: !Sub /arquifusion/${Env}/
